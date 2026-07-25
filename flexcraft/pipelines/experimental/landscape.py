@@ -68,8 +68,10 @@ opt = parse_options(
     std_buffer=3.0,
     temperature=1.0,
     strict="False",
+    hallucinate="True",
     seed=42
 )
+hallucinate = opt.hallucinate == "True"
 
 def cloud_std_default(num_aa):
     minval = num_aa ** 0.4
@@ -165,7 +167,26 @@ def metrics(sequence, key, result: JoltzResult):
         contacts = result.contact_score(num_contacts=25, min_resi_distance=10),
         pae = pae.mean(),
         average_num_nonzero = (sequence > 0.01).sum(axis=-1).mean(),
-        L = dssp["L"], H = dssp["H"], E = dssp["E"]
+        L = dssp["L"], H = dssp["H"], E = dssp["E"],
+        ptm = result.ptm,
+    )
+
+def dssp_to_string(dssp_array) -> str:
+    """Convert an int DSSP array (0=loop, 1=helix, 2=strand) to an 'LHE' string."""
+    code = np.array(list("LHE"))
+    return "".join(code[np.asarray(dssp_array)])
+
+def _structure_comparison(design: DesignData, predicted_data: DesignData) -> dict:
+    """Once-per-attempt comparison between the salad blueprint backbone and the final
+    predicted structure. Not called from metrics()/loss(): must run once per attempt
+    against the converged final structure, not every gradient step."""
+    salad_dssp = np.asarray(design.dssp)
+    predicted_dssp = np.asarray(predicted_data.dssp)
+    return dict(
+        rmsd_to_blueprint=RMSD(atoms=["CA"])(predicted_data, design),
+        dssp_salad=dssp_to_string(salad_dssp),
+        dssp_predicted=dssp_to_string(predicted_dssp),
+        dssp_identity=(salad_dssp == predicted_dssp).mean(),
     )
 
 def _report_trajectory(index: int, writer: ScoreCSV, start_step=0):
@@ -184,7 +205,11 @@ def _report_result(attempt: int, stage: str, key, writer: ScoreCSV, sequence, re
     line_info = dict(attempt=attempt, stage=stage, sequence=aas.decode(jnp.argmax(sequence, axis=-1), aas.AF2_CODE))
     for key in writer.keys:
         if key in aux:
-            line_info[key] = float(aux[key].mean())
+            value = aux[key]
+            if isinstance(value, str):
+                line_info[key] = value
+            else:
+                line_info[key] = float(value.mean())
     writer.write_line(line_info)
     return aux
 
@@ -215,6 +240,7 @@ loss_update = jit_loss_update(loss)
 
 os.makedirs(f"{opt.out_path}/blueprints/", exist_ok=True)
 os.makedirs(f"{opt.out_path}/attempts/", exist_ok=True)
+os.makedirs(f"{opt.out_path}/direct/", exist_ok=True)
 os.makedirs(f"{opt.out_path}/success/", exist_ok=True)
 common_keys = [
     "plddt",
@@ -223,13 +249,16 @@ common_keys = [
     "contacts",
     "pae",
     "average_num_nonzero",
-    "L", "H", "E"
+    "L", "H", "E",
+    "ptm",
 ]
 trajectory_keys = [k for k in common_keys]
 trajectory = ScoreCSV(f"{opt.out_path}/trajectory.csv", keys=["attempt", "step"] + trajectory_keys)
 results_keys = [
     "attempt", "stage", "sequence"
-] + common_keys
+] + common_keys + [
+    "rmsd_to_blueprint", "dssp_salad", "dssp_predicted", "dssp_identity"
+]
 results = ScoreCSV(f"{opt.out_path}/results.csv", keys=results_keys)
 success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys)
 
@@ -254,24 +283,48 @@ while success_count < opt.num_designs:
         pmpnn(key(), design.drop_aa())["logits"],
         aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
     sequence = jax.nn.softmax(sequence / opt.temperature, axis=-1)
-    (_, aux), _ = loss_update(sequence, key=key(), params=params)
-    aux_data: DesignData = aux["result"].to_data()
-    aux_data.save_pdb(f"{opt.out_path}/attempts/design_{attempt}_init.pdb")
-    sequence, loss_val, aux = simplex_agpm(
-        sequence, loss_update, key=key, params=params, context=context,
-        num_steps=50,
-        lr=0.1 * jnp.sqrt(sequence.shape[0]), momentum=0.3,
-        scale=1.0,
-        grad_transform=optax.clip_by_global_norm(1.0),
-        param_transform=lambda x: x.at[:, aas.AF2_CODE.index("C")].set(0.0),
-        verbose=True, return_last=False,
-        early_stop=None,
-        report=_report_trajectory(attempt, trajectory, start_step=0))
-    sequence_1 = sequence
-    result = aux["result"]
-    data = result.to_data()
-    prediction_1 = joltz_pred(
-        key(), JoltzSpec().add_protein(data.to_sequence_string()))
-    stage_1 = _report_result(attempt, "stage_1", key(), results, sequence, prediction_1.result)
-    prediction_1.save_pdb(f"{opt.out_path}/attempts/design_{attempt}.pdb")
+
+    if hallucinate:
+        (_, aux), _ = loss_update(sequence, key=key(), params=params)
+        aux_data: DesignData = aux["result"].to_data()
+        aux_data.save_pdb(f"{opt.out_path}/attempts/design_{attempt}_init.pdb")
+        sequence, loss_val, aux = simplex_agpm(
+            sequence, loss_update, key=key, params=params, context=context,
+            num_steps=50,
+            lr=0.1 * jnp.sqrt(sequence.shape[0]), momentum=0.3,
+            scale=1.0,
+            grad_transform=optax.clip_by_global_norm(1.0),
+            param_transform=lambda x: x.at[:, aas.AF2_CODE.index("C")].set(0.0),
+            verbose=True, return_last=False,
+            early_stop=None,
+            report=_report_trajectory(attempt, trajectory, start_step=0))
+        result = aux["result"]
+        data = result.to_data()
+        hardened_sequence = data.to_sequence_string()
+        prediction_1 = joltz_pred(key(), JoltzSpec().add_protein(hardened_sequence))
+        final_result: JoltzResult = prediction_1.result
+        stage = "stage_1"
+    else:
+        # Predict directly on the soft (un-hardened, un-optimized) ProteinMPNN
+        # initialization, via the exact same evaluator call `loss()` makes every
+        # gradient step - no JoltzSpec/hardening needed, since Joltz2 can consume a
+        # probability-distribution sequence directly through `set_aa`. Deliberately
+        # NOT going through `loss_update`/`loss()`: that function's first two lines
+        # zero out cysteine and renormalize `sequence` internally before predicting,
+        # which would silently desync the reported "sequence" CSV column (decoded
+        # from the caller's untouched `sequence`) from what was actually fed to
+        # Boltz. Calling `joltz(...).predict` directly avoids both that mismatch
+        # and an unused backward pass (loss_update always computes a gradient).
+        joltz_input: JoltzInput = params["joltz_input"].set_aa(sequence)
+        final_result: JoltzResult = joltz(params["joltz"]).predict(key(), joltz_input, num_samples=4)
+        stage = "direct"
+
+    predicted_data = final_result.to_data()
+    report_aux = metrics(sequence, key(), final_result)
+    report_aux.update(_structure_comparison(design, predicted_data))
+    _report_result(attempt, stage, key(), results, sequence, final_result, aux=report_aux)
+    if hallucinate:
+        prediction_1.save_pdb(f"{opt.out_path}/attempts/design_{attempt}.pdb")
+    else:
+        predicted_data.save_pdb(f"{opt.out_path}/direct/design_{attempt}.pdb")
     success_count += 1
