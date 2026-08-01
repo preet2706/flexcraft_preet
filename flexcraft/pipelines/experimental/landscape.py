@@ -2,9 +2,8 @@
 import os
 import time
 from copy import deepcopy, copy
-
-import random
 import optax
+import random
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,11 +16,11 @@ from salad.modules.utils.geometry import positions_to_ncacocb
 import flexcraft.sequence.aa_codes as aas
 from flexcraft.sequence.mpnn import make_pmpnn
 from flexcraft.sequence.sample import *
-from flexcraft.structure.af import *
 from flexcraft.utils import Keygen, parse_options, data_from_salad
 from flexcraft.files import ScoreCSV, PDBFile
 from flexcraft.structure.boltz import Joltz2, JoltzInput, JoltzResult, JoltzSpec
 from flexcraft.hallucination.opt import jit_loss_update, simplex_agpm
+from flexcraft.data.data import DesignData
 
 from flexcraft.rosetta.relax import fastrelax, pair_energies
 import pyrosetta as pr
@@ -255,7 +254,7 @@ common_keys = [
 trajectory_keys = [k for k in common_keys]
 trajectory = ScoreCSV(f"{opt.out_path}/trajectory.csv", keys=["attempt", "step"] + trajectory_keys)
 results_keys = [
-    "attempt", "stage", "sequence"
+    "attempt", "stage", "init", "sequence"
 ] + common_keys + [
     "rmsd_to_blueprint", "dssp_salad", "dssp_predicted", "dssp_identity"
 ]
@@ -303,28 +302,21 @@ while success_count < opt.num_designs:
         hardened_sequence = data.to_sequence_string()
         prediction_1 = joltz_pred(key(), JoltzSpec().add_protein(hardened_sequence))
         final_result: JoltzResult = prediction_1.result
-        stage = "stage_1"
-    else:
-        # Predict directly on the soft (un-hardened, un-optimized) ProteinMPNN
-        # initialization, via the exact same evaluator call `loss()` makes every
-        # gradient step - no JoltzSpec/hardening needed, since Joltz2 can consume a
-        # probability-distribution sequence directly through `set_aa`. Deliberately
-        # NOT going through `loss_update`/`loss()`: that function's first two lines
-        # zero out cysteine and renormalize `sequence` internally before predicting,
-        # which would silently desync the reported "sequence" CSV column (decoded
-        # from the caller's untouched `sequence`) from what was actually fed to
-        # Boltz. Calling `joltz(...).predict` directly avoids both that mismatch
-        # and an unused backward pass (loss_update always computes a gradient).
-        joltz_input: JoltzInput = params["joltz_input"].set_aa(sequence)
-        final_result: JoltzResult = joltz(params["joltz"]).predict(key(), joltz_input, num_samples=4)
-        stage = "direct"
-
-    predicted_data = final_result.to_data()
-    report_aux = metrics(sequence, key(), final_result)
-    report_aux.update(_structure_comparison(design, predicted_data))
-    _report_result(attempt, stage, key(), results, sequence, final_result, aux=report_aux)
-    if hallucinate:
+        predicted_data = final_result.to_data()
+        report_aux = metrics(sequence, key(), final_result)
+        report_aux.update(_structure_comparison(design, predicted_data))
+        report_aux["init"] = "hard"
+        _report_result(attempt, "stage_1", key(), results, sequence, final_result, aux=report_aux)
         prediction_1.save_pdb(f"{opt.out_path}/attempts/design_{attempt}.pdb")
     else:
-        predicted_data.save_pdb(f"{opt.out_path}/direct/design_{attempt}.pdb")
+        hard_sequence = jax.nn.one_hot(jnp.argmax(sequence, axis=-1), 20)
+        for init_label, seq_variant in (("soft", sequence), ("hard", hard_sequence)):
+            joltz_input: JoltzInput = params["joltz_input"].set_aa(seq_variant)
+            final_result: JoltzResult = joltz(params["joltz"]).predict(key(), joltz_input, num_samples=4)
+            predicted_data = final_result.to_data()
+            report_aux = metrics(seq_variant, key(), final_result)
+            report_aux.update(_structure_comparison(design, predicted_data))
+            report_aux["init"] = init_label
+            _report_result(attempt, "direct", key(), results, seq_variant, final_result, aux=report_aux)
+            predicted_data.save_pdb(f"{opt.out_path}/direct/design_{attempt}_{init_label}.pdb")
     success_count += 1
