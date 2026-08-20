@@ -21,6 +21,7 @@ from flexcraft.files import ScoreCSV, PDBFile
 from flexcraft.structure.boltz import Joltz2, JoltzInput, JoltzResult, JoltzSpec
 from flexcraft.hallucination.opt import jit_loss_update, simplex_agpm
 from flexcraft.data.data import DesignData
+from flexcraft.pipelines.utils import bias_dssp
 
 from flexcraft.rosetta.relax import fastrelax, pair_energies
 import pyrosetta as pr
@@ -68,9 +69,28 @@ opt = parse_options(
     temperature=1.0,
     strict="False",
     hallucinate="True",
+    avg_init="False",
+    init_batch_size=10,
+    avg_space="prob",
+    l_bias=0.0,
+    h_bias=0.0,
+    e_bias=0.0,
     seed=42
 )
 hallucinate = opt.hallucinate == "True"
+avg_init = opt.avg_init == "True"
+use_bias = (opt.l_bias > 0.0) or (opt.h_bias > 0.0) or (opt.e_bias > 0.0)
+init_batch_size = opt.init_batch_size if avg_init else 1
+assert init_batch_size >= 1, "--init_batch_size must be >= 1"
+if avg_init and not use_bias:
+    print("WARNING: --avg_init with all biases 0.0 -- each batch member keeps its own "
+          "random hard DSSP target, so the averaged distribution mixes unrelated folds.")
+if use_bias:
+    _bias_sum = opt.l_bias + opt.h_bias + opt.e_bias
+    if not (0.9 <= _bias_sum <= 1.1):
+        print(f"WARNING: --l/h/e_bias sum to {_bias_sum:.3f}. salad's dssp_mean "
+              "conditioning was trained on normalized L/H/E frequencies; "
+              "values summing to ~1.0 are strongly recommended.")
 
 def cloud_std_default(num_aa):
     minval = num_aa ** 0.4
@@ -107,6 +127,14 @@ salad_data, init_prev = si.data.from_config(
     chain_index=chain,
     cyclic_mask=cyclic_mask)
 
+# Soft secondary-structure conditioning. salad reads dssp_mean/dssp_mean_mask as a
+# channel independent of (and additive with) the hard per-residue dssp_condition, so
+# biasing means setting this once and never setting dssp_condition.
+if use_bias:
+    salad_data = bias_dssp(salad_data, L=opt.l_bias, H=opt.h_bias, E=opt.e_bias)
+    assert "dssp_condition" not in salad_data
+    print(f"soft DSSP bias (L,H,E) = ({opt.l_bias}, {opt.h_bias}, {opt.e_bias})")
+
 salad_step = model_step(salad_config)
 # build a sampler object for sampling
 sampler = si.Sampler(salad_step, out_steps=400)
@@ -141,6 +169,51 @@ def batch_mpnn(mpnn):
         else:
             return mpnn(params, key, data)
     return _mpnn_map
+
+batched_pmpnn = jax.jit(batch_mpnn(_pmpnn))
+
+def sample_init_batch(batch_size):
+    """Generate `batch_size` independent salad backbones sharing the run's secondary
+    structure conditioning, and average their ProteinMPNN distributions.
+
+    Returns:
+        designs: list of `batch_size` DesignData blueprints.
+        sequence: (L, 20) float32 amino acid distribution, rows summing to 1.
+    """
+    designs = []
+    for _ in range(batch_size):
+        if not use_bias:
+            # unbiased: keep the hard random-DSSP target, redrawn per batch member
+            salad_data["dssp_condition"], dssp_string = si.random_dssp(
+                num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
+            print("DSSP target:", dssp_string)
+        salad_data["cloud_std"] = cloud_std_default(num_aa)
+        designs.append(data_from_salad(
+            sampler(salad_params, key(), salad_data, init_prev)))
+
+    # One vmapped ProteinMPNN pass over the batch. Only atom_positions differs between
+    # members; batch_mpnn repeats the rest, which is valid here because num_aa is fixed
+    # for the whole run and every member is fully sequence-masked. A plain dict is passed
+    # rather than a DesignData so the jitted pytree structure stays constant.
+    rep = designs[0]
+    mpnn_batch = dict(
+        atom_positions=jnp.stack(
+            [jnp.asarray(d["atom_positions"]) for d in designs], axis=0),
+        atom_mask=jnp.asarray(rep["atom_mask"]),
+        mask=jnp.asarray(rep["mask"]),
+        aa=jnp.full((num_aa,), 20, dtype=jnp.int32),
+        residue_index=jnp.asarray(rep["residue_index"]),
+        chain_index=jnp.asarray(rep["chain_index"]),
+        batch_index=jnp.asarray(rep["batch_index"]),
+    )
+    logits = batched_pmpnn(params["mpnn"], key(), mpnn_batch)["logits"]
+    logits = aas.translate_onehot(logits, aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
+    if opt.avg_space == "logit":
+        sequence = jax.nn.softmax(logits.mean(axis=0) / opt.temperature, axis=-1)
+    else:
+        sequence = jax.nn.softmax(logits / opt.temperature, axis=-1).mean(axis=0)
+    sequence = sequence / sequence.sum(axis=-1, keepdims=True)
+    return designs, sequence
 
 def metrics(sequence, key, result: JoltzResult):
     data = result.to_data(return_samples=True)
@@ -186,6 +259,45 @@ def _structure_comparison(design: DesignData, predicted_data: DesignData) -> dic
         dssp_salad=dssp_to_string(salad_dssp),
         dssp_predicted=dssp_to_string(predicted_dssp),
         dssp_identity=(salad_dssp == predicted_dssp).mean(),
+    )
+
+def _structure_comparison_batch(designs, predicted_data: DesignData) -> dict:
+    """_structure_comparison generalized to a batch of blueprints.
+
+    With an averaged initialization there is no single blueprint, so the canonical
+    rmsd_to_blueprint / dssp_salad / dssp_identity are taken from the *closest* batch
+    member (all three from the same member, so the row stays internally consistent and
+    dssp_salad refers to a real on-disk PDB named by blueprint_index). The batch mean is
+    reported alongside: a small min-vs-mean gap means the batch was structurally
+    homogeneous, a large gap means the design collapsed onto one member.
+    Also records the batch's own mean L/H/E composition, which is the direct check that
+    the secondary-structure bias took effect.
+    """
+    per_member = [_structure_comparison(d, predicted_data) for d in designs]
+    if len(per_member) == 1:
+        return per_member[0]
+    rmsds = np.array([float(p["rmsd_to_blueprint"]) for p in per_member])
+    best = int(rmsds.argmin())
+    result = dict(per_member[best])
+    p_dssp = [d.p_dssp for d in designs]
+    result.update(
+        rmsd_to_blueprint_mean=np.float32(rmsds.mean()),
+        dssp_identity_mean=np.float32(
+            np.mean([float(p["dssp_identity"]) for p in per_member])),
+        blueprint_index=np.float32(best),
+        batch_L=np.float32(np.mean([float(x["L"]) for x in p_dssp])),
+        batch_H=np.float32(np.mean([float(x["H"]) for x in p_dssp])),
+        batch_E=np.float32(np.mean([float(x["E"]) for x in p_dssp])),
+    )
+    return result
+
+def _init_provenance() -> dict:
+    """Record how this design's starting distribution was built.
+    Numeric values are numpy scalars because _report_result calls .mean() on them."""
+    return dict(
+        init_mode="avg" if avg_init else "single",
+        init_batch=np.float32(init_batch_size),
+        bias_lhe=(f"{opt.l_bias}|{opt.h_bias}|{opt.e_bias}" if use_bias else "none"),
     )
 
 def _report_trajectory(index: int, writer: ScoreCSV, start_step=0):
@@ -241,6 +353,8 @@ os.makedirs(f"{opt.out_path}/blueprints/", exist_ok=True)
 os.makedirs(f"{opt.out_path}/attempts/", exist_ok=True)
 os.makedirs(f"{opt.out_path}/direct/", exist_ok=True)
 os.makedirs(f"{opt.out_path}/success/", exist_ok=True)
+if avg_init:
+    os.makedirs(f"{opt.out_path}/init_dist/", exist_ok=True)
 common_keys = [
     "plddt",
     "entropy",
@@ -257,7 +371,11 @@ results_keys = [
     "attempt", "stage", "init", "sequence"
 ] + common_keys + [
     "rmsd_to_blueprint", "dssp_salad", "dssp_predicted", "dssp_identity"
-]
+] + ([
+    "init_mode", "init_batch", "bias_lhe",
+    "rmsd_to_blueprint_mean", "dssp_identity_mean", "blueprint_index",
+    "batch_L", "batch_H", "batch_E",
+] if avg_init else [])
 results = ScoreCSV(f"{opt.out_path}/results.csv", keys=results_keys)
 success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys)
 
@@ -271,17 +389,26 @@ while success_count < opt.num_designs:
         recovery=10.0,
         ipae=0.05,
     )
-    salad_data["dssp_condition"], dssp_string = si.random_dssp(
-        num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
-    print("DSSP target:", dssp_string)
-    salad_data["cloud_std"] = cloud_std_default(num_aa)
-    salad_design = sampler(salad_params, key(), salad_data, init_prev)
-    design = data_from_salad(salad_design)
-    design.save_pdb(f"{opt.out_path}/blueprints/design_{attempt}.pdb")
-    sequence = aas.translate_onehot(
-        pmpnn(key(), design.drop_aa())["logits"],
-        aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
-    sequence = jax.nn.softmax(sequence / opt.temperature, axis=-1)
+    if avg_init:
+        designs, sequence = sample_init_batch(init_batch_size)
+        for member, member_design in enumerate(designs):
+            member_design.save_pdb(
+                f"{opt.out_path}/blueprints/design_{attempt}_{member}.pdb")
+        np.save(f"{opt.out_path}/init_dist/design_{attempt}.npy", np.asarray(sequence))
+    else:
+        if not use_bias:
+            salad_data["dssp_condition"], dssp_string = si.random_dssp(
+                num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
+            print("DSSP target:", dssp_string)
+        salad_data["cloud_std"] = cloud_std_default(num_aa)
+        salad_design = sampler(salad_params, key(), salad_data, init_prev)
+        design = data_from_salad(salad_design)
+        design.save_pdb(f"{opt.out_path}/blueprints/design_{attempt}.pdb")
+        sequence = aas.translate_onehot(
+            pmpnn(key(), design.drop_aa())["logits"],
+            aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
+        sequence = jax.nn.softmax(sequence / opt.temperature, axis=-1)
+        designs = [design]
 
     if hallucinate:
         (_, aux), _ = loss_update(sequence, key=key(), params=params)
@@ -304,8 +431,9 @@ while success_count < opt.num_designs:
         final_result: JoltzResult = prediction_1.result
         predicted_data = final_result.to_data()
         report_aux = metrics(sequence, key(), final_result)
-        report_aux.update(_structure_comparison(design, predicted_data))
-        report_aux["init"] = "hard"
+        report_aux.update(_structure_comparison_batch(designs, predicted_data))
+        report_aux["init"] = "soft"
+        report_aux.update(_init_provenance())
         _report_result(attempt, "stage_1", key(), results, sequence, final_result, aux=report_aux)
         prediction_1.save_pdb(f"{opt.out_path}/attempts/design_{attempt}.pdb")
     else:
@@ -315,8 +443,9 @@ while success_count < opt.num_designs:
             final_result: JoltzResult = joltz(params["joltz"]).predict(key(), joltz_input, num_samples=4)
             predicted_data = final_result.to_data()
             report_aux = metrics(seq_variant, key(), final_result)
-            report_aux.update(_structure_comparison(design, predicted_data))
+            report_aux.update(_structure_comparison_batch(designs, predicted_data))
             report_aux["init"] = init_label
+            report_aux.update(_init_provenance())
             _report_result(attempt, "direct", key(), results, seq_variant, final_result, aux=report_aux)
             predicted_data.save_pdb(f"{opt.out_path}/direct/design_{attempt}_{init_label}.pdb")
     success_count += 1
