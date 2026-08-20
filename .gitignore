@@ -12,8 +12,6 @@ dependencies/
 slurm/
 slurm-*.out
 CLAUDE.md
-test_run/
-test_run_20/
-test_run_hallucinate/
+runs/
 bash_scripts/
 slurm_logs/
