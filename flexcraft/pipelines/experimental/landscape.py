@@ -72,6 +72,9 @@ opt = parse_options(
     avg_init="False",
     init_batch_size=10,
     avg_space="prob",
+    avg_mode="bias",
+    init_temperature=0.4,
+    partial_start_steps=200,
     l_bias=0.0,
     h_bias=0.0,
     e_bias=0.0,
@@ -82,8 +85,17 @@ avg_init = opt.avg_init == "True"
 use_bias = (opt.l_bias > 0.0) or (opt.h_bias > 0.0) or (opt.e_bias > 0.0)
 init_batch_size = opt.init_batch_size if avg_init else 1
 assert init_batch_size >= 1, "--init_batch_size must be >= 1"
-if avg_init and not use_bias:
-    print("WARNING: --avg_init with all biases 0.0 -- each batch member keeps its own "
+assert opt.avg_mode in ("bias", "partial", "same_dssp"), \
+    f"unknown --avg_mode {opt.avg_mode!r}; expected bias | partial | same_dssp"
+# Post-averaging sharpening only makes sense when the batch members are structurally
+# unrelated (bias mode). In partial/same_dssp the members already share a fold, so the
+# average stays sharp on its own and sharpening would only over-commit it.
+init_temperature = opt.init_temperature if opt.avg_mode == "bias" else 1.0
+if avg_init and opt.avg_mode != "bias" and opt.init_temperature != 1.0:
+    print(f"NOTE: --init_temperature ignored in --avg_mode {opt.avg_mode} "
+          "(batch members are structurally similar by construction).")
+if avg_init and opt.avg_mode == "bias" and not use_bias:
+    print("WARNING: --avg_mode bias with all biases 0.0 -- each batch member keeps its own "
           "random hard DSSP target, so the averaged distribution mixes unrelated folds.")
 if use_bias:
     _bias_sum = opt.l_bias + opt.h_bias + opt.e_bias
@@ -172,15 +184,11 @@ def batch_mpnn(mpnn):
 
 batched_pmpnn = jax.jit(batch_mpnn(_pmpnn))
 
-def sample_init_batch(batch_size):
-    """Generate `batch_size` independent salad backbones sharing the run's secondary
-    structure conditioning, and average their ProteinMPNN distributions.
-
-    Returns:
-        designs: list of `batch_size` DesignData blueprints.
-        sequence: (L, 20) float32 amino acid distribution, rows summing to 1.
-    """
-    designs = []
+def _sample_bias_batch(batch_size):
+    """`bias` mode: `batch_size` independent full-diffusion backbones under the run's
+    soft dssp_mean bias. Members share only a statistical L/H/E composition, so their
+    folds -- and therefore what residue index i means -- are unrelated."""
+    raw = []
     for _ in range(batch_size):
         if not use_bias:
             # unbiased: keep the hard random-DSSP target, redrawn per batch member
@@ -188,13 +196,56 @@ def sample_init_batch(batch_size):
                 num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
             print("DSSP target:", dssp_string)
         salad_data["cloud_std"] = cloud_std_default(num_aa)
-        designs.append(data_from_salad(
-            sampler(salad_params, key(), salad_data, init_prev)))
+        raw.append(sampler(salad_params, key(), salad_data, init_prev))
+    return raw, None
 
-    # One vmapped ProteinMPNN pass over the batch. Only atom_positions differs between
-    # members; batch_mpnn repeats the rest, which is valid here because num_aa is fixed
-    # for the whole run and every member is fully sequence-masked. A plain dict is passed
-    # rather than a DesignData so the jitted pytree structure stays constant.
+def _sample_same_dssp_batch(batch_size):
+    """`same_dssp` mode: one random DSSP target for this design, then `batch_size`
+    independent full-diffusion backbones all conditioned on it. Same secondary-structure
+    blueprint, independently sampled folds."""
+    salad_data["dssp_condition"], dssp_string = si.random_dssp(
+        num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
+    print("DSSP target (shared):", dssp_string)
+    raw = []
+    for _ in range(batch_size):
+        # cloud_std and the RNG key are the only sources of variation between members
+        salad_data["cloud_std"] = cloud_std_default(num_aa)
+        raw.append(sampler(salad_params, key(), salad_data, init_prev))
+    return raw, None
+
+def _sample_partial_batch(batch_size):
+    """`partial` mode: one parent backbone by full diffusion, then `batch_size` variants
+    by partial diffusion of that same parent.
+
+    salad re-noises `data["pos"]` inside the step function on every iteration, so entering
+    the loop at `start_steps` with the parent's coordinates in `pos` re-noises the parent
+    to sigma(1 - start_steps/500) and denoises from there. `sample()` shallow-copies its
+    data argument, so every variant restarts from the parent rather than drifting."""
+    salad_data["dssp_condition"], dssp_string = si.random_dssp(
+        num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
+    print("DSSP target (parent):", dssp_string)
+    salad_data["cloud_std"] = cloud_std_default(num_aa)
+    parent = sampler(salad_params, key(), salad_data, init_prev)
+    raw = []
+    for _ in range(batch_size):
+        # fresh shallow copy so the module-level salad_data is never mutated; the parent's
+        # own output is already in salad's (L, 5 + augment_size, 3) layout with real
+        # augmented atoms, so no PDB round-trip or positions_to_ncacocb re-derivation
+        variant_data = dict(salad_data)
+        variant_data["pos"] = parent["pos"]
+        variant_data["cloud_std"] = cloud_std_default(num_aa)
+        raw.append(sampler(salad_params, key(), variant_data, init_prev,
+                           start_steps=opt.partial_start_steps))
+    return raw, parent
+
+def _average_mpnn(designs):
+    """Elementwise average of the ProteinMPNN distributions over a batch of blueprints.
+
+    One vmapped ProteinMPNN pass over the batch. Only atom_positions differs between
+    members; batch_mpnn repeats the rest, which is valid here because num_aa is fixed
+    for the whole run and every member is fully sequence-masked. A plain dict is passed
+    rather than a DesignData so the jitted pytree structure stays constant.
+    """
     rep = designs[0]
     mpnn_batch = dict(
         atom_positions=jnp.stack(
@@ -209,11 +260,38 @@ def sample_init_batch(batch_size):
     logits = batched_pmpnn(params["mpnn"], key(), mpnn_batch)["logits"]
     logits = aas.translate_onehot(logits, aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
     if opt.avg_space == "logit":
-        sequence = jax.nn.softmax(logits.mean(axis=0) / opt.temperature, axis=-1)
+        return jax.nn.softmax(logits.mean(axis=0) / opt.temperature, axis=-1)
+    return jax.nn.softmax(logits / opt.temperature, axis=-1).mean(axis=0)
+
+def sample_init_batch(batch_size):
+    """Generate a batch of blueprints per `--avg_mode` and average their ProteinMPNN
+    distributions into one starting sequence.
+
+    Returns:
+        designs: list of `batch_size` DesignData blueprints.
+        sequence: (L, 20) float32 amino acid distribution, rows summing to 1.
+        parent: DesignData parent blueprint in `partial` mode, else None.
+    """
+    if opt.avg_mode == "partial":
+        raw, parent_raw = _sample_partial_batch(batch_size)
+    elif opt.avg_mode == "same_dssp":
+        raw, parent_raw = _sample_same_dssp_batch(batch_size)
     else:
-        sequence = jax.nn.softmax(logits / opt.temperature, axis=-1).mean(axis=0)
-    sequence = sequence / sequence.sum(axis=-1, keepdims=True)
-    return designs, sequence
+        raw, parent_raw = _sample_bias_batch(batch_size)
+    designs = [data_from_salad(r) for r in raw]
+    parent = data_from_salad(parent_raw) if parent_raw is not None else None
+
+    sequence = _average_mpnn(designs)
+    if init_temperature != 1.0:
+        # Temperature acts on logits, so go back to log-space: softmax(log p / T) is
+        # p^(1/T) normalized. Applying softmax(p / T) directly would instead compute
+        # exp(p/T)/sum(exp(p/T)), which flattens toward uniform (measured: num_nonzero
+        # 20.00 / max_prob 0.065, versus the correct 10.53 / 0.352).
+        sequence = jax.nn.softmax(jnp.log(sequence + 1e-9) / init_temperature, axis=-1)
+    # No explicit re-normalization: softmax already normalizes exactly when sharpening
+    # runs, and otherwise the mean-of-B drift is float32 rounding (max 1.19e-07) that
+    # loss() and project_to_simplex both absorb downstream.
+    return designs, sequence, parent
 
 def metrics(sequence, key, result: JoltzResult):
     data = result.to_data(return_samples=True)
@@ -298,7 +376,33 @@ def _init_provenance() -> dict:
         init_mode="avg" if avg_init else "single",
         init_batch=np.float32(init_batch_size),
         bias_lhe=(f"{opt.l_bias}|{opt.h_bias}|{opt.e_bias}" if use_bias else "none"),
+        avg_mode=opt.avg_mode if avg_init else "none",
+        partial_steps=np.float32(
+            opt.partial_start_steps if (avg_init and opt.avg_mode == "partial") else 0),
+        init_temp=np.float32(init_temperature),
     )
+
+def _init_sharpness(sequence) -> dict:
+    """Flatness of the starting distribution -- the early-warning column for the
+    all-helix collapse. A single-backbone ProteinMPNN pass at T=1.0 sits at
+    num_nonzero 11.95 / max_prob 0.370; num_nonzero >= 15 with max_prob <= 0.25 is the
+    zone where Boltz fell back to a pure helix in practice."""
+    s = np.asarray(sequence)
+    return dict(
+        init_num_nonzero=np.float32((s > 0.01).sum(axis=-1).mean()),
+        init_max_prob=np.float32(s.max(axis=-1).mean()),
+    )
+
+def _batch_spread(designs, parent=None) -> dict:
+    """Mean CA-RMSD of the batch members to a reference (the parent in `partial` mode,
+    otherwise member 0). This is the direct check that partial/same_dssp actually produce
+    structurally SIMILAR blueprints -- the premise that makes averaging meaningful."""
+    reference = parent if parent is not None else designs[0]
+    others = designs if parent is not None else designs[1:]
+    if not others:
+        return {}
+    rmsds = [float(RMSD(atoms=["CA"])(d, reference)) for d in others]
+    return dict(batch_rmsd_to_ref=np.float32(np.mean(rmsds)))
 
 def _report_trajectory(index: int, writer: ScoreCSV, start_step=0):
     def _report(step: int, loss: float, aux: dict):
@@ -373,6 +477,8 @@ results_keys = [
     "rmsd_to_blueprint", "dssp_salad", "dssp_predicted", "dssp_identity"
 ] + ([
     "init_mode", "init_batch", "bias_lhe",
+    "avg_mode", "partial_steps", "init_temp",
+    "init_num_nonzero", "init_max_prob", "batch_rmsd_to_ref",
     "rmsd_to_blueprint_mean", "dssp_identity_mean", "blueprint_index",
     "batch_L", "batch_H", "batch_E",
 ] if avg_init else [])
@@ -390,12 +496,17 @@ while success_count < opt.num_designs:
         ipae=0.05,
     )
     if avg_init:
-        designs, sequence = sample_init_batch(init_batch_size)
+        designs, sequence, parent_design = sample_init_batch(init_batch_size)
         for member, member_design in enumerate(designs):
             member_design.save_pdb(
                 f"{opt.out_path}/blueprints/design_{attempt}_{member}.pdb")
+        if parent_design is not None:
+            # reference for batch_rmsd_to_ref; not recoverable from the batch otherwise
+            parent_design.save_pdb(
+                f"{opt.out_path}/blueprints/design_{attempt}_parent.pdb")
         np.save(f"{opt.out_path}/init_dist/design_{attempt}.npy", np.asarray(sequence))
     else:
+        parent_design = None
         if not use_bias:
             salad_data["dssp_condition"], dssp_string = si.random_dssp(
                 num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
@@ -409,6 +520,14 @@ while success_count < opt.num_designs:
             aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
         sequence = jax.nn.softmax(sequence / opt.temperature, axis=-1)
         designs = [design]
+
+    # capture before hallucination overwrites `sequence`
+    init_diagnostics = _init_sharpness(sequence)
+    init_diagnostics.update(_batch_spread(designs, parent_design))
+    print(f"init distribution: num_nonzero={float(init_diagnostics['init_num_nonzero']):.2f} "
+          f"max_prob={float(init_diagnostics['init_max_prob']):.3f}"
+          + (f" batch_rmsd_to_ref={float(init_diagnostics['batch_rmsd_to_ref']):.2f}"
+             if "batch_rmsd_to_ref" in init_diagnostics else ""))
 
     if hallucinate:
         (_, aux), _ = loss_update(sequence, key=key(), params=params)
@@ -434,6 +553,7 @@ while success_count < opt.num_designs:
         report_aux.update(_structure_comparison_batch(designs, predicted_data))
         report_aux["init"] = "soft"
         report_aux.update(_init_provenance())
+        report_aux.update(init_diagnostics)
         _report_result(attempt, "stage_1", key(), results, sequence, final_result, aux=report_aux)
         prediction_1.save_pdb(f"{opt.out_path}/attempts/design_{attempt}.pdb")
     else:
@@ -446,6 +566,7 @@ while success_count < opt.num_designs:
             report_aux.update(_structure_comparison_batch(designs, predicted_data))
             report_aux["init"] = init_label
             report_aux.update(_init_provenance())
+            report_aux.update(init_diagnostics)
             _report_result(attempt, "direct", key(), results, seq_variant, final_result, aux=report_aux)
             predicted_data.save_pdb(f"{opt.out_path}/direct/design_{attempt}_{init_label}.pdb")
     success_count += 1
