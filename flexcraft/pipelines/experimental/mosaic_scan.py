@@ -57,13 +57,43 @@ opt = parse_options(
     std_buffer=3.0,
     clear_jit_cache="False",
     seed=42,
+    # --- docked blueprint mode -----------------------------------------------------------
+    dock_blueprint="False",       # generate the blueprint AGAINST the target at a hotspot
+    salad_ve_path="params/salad/default_ve_scaled-200k.jax",
+    hotspot_file="none",          # CSV: target,hotspots  (e.g. "proteinG,A20-30")
+    target_pdb_dir="none",        # default {out_path}/target_structures
+    # Use the target's cached structure (single-sequence prediction) as a Boltz TEMPLATE for
+    # every complex prediction, instead of an MSA. Independent of --dock_blueprint: predicting
+    # and caching the target structure happens whenever either flag is set.
+    target_use_template="False",
+    epitope_cutoff=8.0,
+    epitope_cutoff_2=10.0,        # second cutoff, to check the metric isn't cutoff-driven
+    # salad binder potentials (defaults from bind/config.py BINDER_OPT)
+    radius=10.0,
+    clash_radius=10.0,
+    coldspot_radius=15.0,
+    min_center_distance=2.0,
+    clash_lr=5e-3,
+    compact_lr=1e-4,
+    contact_lr=1e-2,
+    relax_cutoff=3.0,
+    fix_center_threshold=2.0,
+    prev_threshold=0.9,
+    l_bias=0.0,
+    h_bias=0.0,
+    e_bias=0.0,
 )
 
 binder_length = opt.length
-sample_structure = opt.sample_structure == "True"
-# No per-target hotspot spec is available from bare sequences. With hotspot_index=None,
-# metrics()'s hotspot_selector falls back to `chain_index != 0`, so `hotspot_contacts`
-# degrades to the symmetrized binder<->whole-target contact score.
+dock_blueprint = opt.dock_blueprint == "True"
+use_target_template = opt.target_use_template == "True"
+# In docked mode the blueprint comes from the target-conditioned ve model, so the free-monomer
+# vp path is switched off entirely (different model, different length, dead cloud_std).
+sample_structure = (opt.sample_structure == "True") and not dock_blueprint
+# No per-target hotspot spec reaches the Boltz loss: the hotspot biases the BLUEPRINT only, so
+# that the ProteinMPNN sequence is the single causal channel from pose to hallucination. With
+# hotspot_index=None, metrics()'s hotspot_selector falls back to `chain_index != 0`, so
+# `hotspot_contacts` degrades to the symmetrized binder<->whole-target contact score.
 hotspot_index = None
 
 # ---------------------------------------------------------------------------------------
@@ -99,6 +129,88 @@ assert targets, f"no targets selected from {opt.targets}"
 print(f"{len(targets)} targets: " + ", ".join(f"{n}({len(s)})" for n, s in targets))
 
 # ---------------------------------------------------------------------------------------
+# hotspot file (docked mode only)
+#
+# Numbering contract: the target structure is a Boltz prediction OF THE FASTA SEQUENCE, which
+# Boltz writes as chain A, residues 1..N in sequence order. So a hotspot is "A<i>" with i the
+# 1-based position in the fasta sequence -- NOT a crystal structure's author numbering.
+# ---------------------------------------------------------------------------------------
+
+def _expand_hotspot_spec(spec: str, target_name: str, target_length: int) -> str:
+    """Expand "A20-30,A45" into the flat "A20,A21,...,A30,A45" that parse_hotspots wants
+    (it has no range support: it does int(h[1:]) on each comma-separated token)."""
+    out = []
+    for chunk in spec.strip().split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        chain, rest = chunk[0], chunk[1:]
+        if chain not in "ABCDEFGHIJKLMNOPQRSTUVW":
+            raise ValueError(
+                f"{target_name}: hotspot chain '{chain}' in '{chunk}' is not in "
+                f"'ABCDEFGHIJKLMNOPQRSTUVW' (parse_hotspots maps the letter through that "
+                f"fixed alphabet). Predicted targets are single-chain 'A'.")
+        if "-" in rest:
+            start, end = [int(v) for v in rest.split("-", 1)]
+        else:
+            start = end = int(rest)
+        if not (1 <= start <= end <= target_length):
+            raise ValueError(
+                f"{target_name}: hotspot '{chunk}' is out of range for a {target_length}-residue "
+                f"target (valid: {chain}1-{chain}{target_length}). Hotspot numbering is 1-based "
+                f"over the fasta sequence.")
+        out.extend(f"{chain}{i}" for i in range(start, end + 1))
+    if not out:
+        raise ValueError(f"{target_name}: empty hotspot spec")
+    return ",".join(out)
+
+def _compact_spec(spec: str) -> str:
+    """Compress an expanded spec back to ranges joined by '+'.
+
+    ScoreCSV does no quoting (files/csv.py:31), so the comma-joined form would corrupt the
+    row. "A20,A21,...,A30,A45" -> "A20-30+A45".
+    """
+    if not spec:
+        return "none"
+    items = []
+    for tok in spec.split(","):
+        items.append((tok[0], int(tok[1:])))
+    out, i = [], 0
+    while i < len(items):
+        chain, start = items[i]
+        end = start
+        while (i + 1 < len(items) and items[i + 1][0] == chain
+               and items[i + 1][1] == end + 1):
+            i += 1
+            end = items[i][1]
+        out.append(f"{chain}{start}" if start == end else f"{chain}{start}-{end}")
+        i += 1
+    return "+".join(out)
+
+hotspot_specs = {}
+if dock_blueprint:
+    assert opt.hotspot_file != "none", (
+        "--dock_blueprint True requires --hotspot_file. Falling back to all-target hotspots "
+        "would make sample_centers_basic allocate an (L*num_samples, L, 3) array per iteration "
+        "and would not be the experiment you asked for.")
+    lengths = {n: len(s.replace(":", "")) for n, s in targets}
+    with open(opt.hotspot_file, "rt") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#") or line.lower().startswith("target,"):
+                continue
+            name, _, spec = line.partition(",")
+            name, spec = name.strip(), spec.strip()
+            if name not in lengths:
+                continue  # a hotspot entry for a target not in this run
+            hotspot_specs[name] = _expand_hotspot_spec(spec, name, lengths[name])
+    missing = [n for n, _ in targets if n not in hotspot_specs]
+    assert not missing, (
+        f"--hotspot_file {opt.hotspot_file} has no entry for: {missing}. "
+        f"Add them, or restrict the run with --only_targets.")
+    print(f"hotspots loaded for {len(hotspot_specs)} targets")
+
+# ---------------------------------------------------------------------------------------
 # per-target MSA cache
 #
 # mosaic.py rebuilds its re-prediction spec with use_msa=True on every attempt and every
@@ -110,11 +222,42 @@ print(f"{len(targets)} targets: " + ", ".join(f"{n}({len(s)})" for n, s in targe
 # cache on a CPU/login node without touching a GPU.
 # ---------------------------------------------------------------------------------------
 
+def _seq_hash(sequence: str) -> str:
+    return hashlib.sha256(sequence.encode("utf-8")).hexdigest()[:16]
+
+def _pdb_to_template_cif(pdb_path: str, cif_path: str) -> None:
+    """Convert a plain flexcraft-written PDB into an mmCIF that Boltz's add_template() can
+    actually read.
+
+    add_template() on a .pdb goes through gemmi -> a round-tripped mmCIF -> Boltz's own
+    parse_mmcif, which requires _entity_poly.pdbx_seq_one_letter_code to be populated.
+    DesignData.save_pdb() writes no SEQRES, and gemmi.Structure.setup_entities() alone leaves
+    entity.full_sequence empty, so the round-tripped mmCIF has pdbx_seq_one_letter_code='?' and
+    boltz/data/parse/mmcif.py:parse_polymer raises `IndexError: list index out of range`
+    (verified empirically -- add_template() on a save_pdb() output crashes with this error).
+    Setting full_sequence explicitly from the actual residues before writing works around it.
+
+    Assumes a single-chain (or single-entity-per-chain) target, matching how
+    _predict_target_pdb below always builds it.
+    """
+    import gemmi
+    structure = gemmi.read_structure(pdb_path)
+    structure.setup_entities()
+    chain_residues = {ch.name: [r.name for r in ch] for m in structure for ch in m}
+    for entity in structure.entities:
+        entity.full_sequence = chain_residues[entity.subchains[0][0]]
+    structure.assign_label_seq_id()
+    structure.make_mmcif_document().write_file(cif_path)
+
 msa_dir = f"{opt.out_path}/msa" if opt.msa_dir == "none" else opt.msa_dir
 os.makedirs(msa_dir, exist_ok=True)
+target_pdb_dir = (f"{opt.out_path}/target_structures"
+                  if opt.target_pdb_dir == "none" else opt.target_pdb_dir)
+if dock_blueprint or use_target_template:
+    os.makedirs(target_pdb_dir, exist_ok=True)
 msa_paths = {}
 for name, target_sequence in targets:
-    digest = hashlib.sha256(target_sequence.encode("utf-8")).hexdigest()[:16]
+    digest = _seq_hash(target_sequence)
     path = f"{msa_dir}/{name}_{digest}.npz"
     if not os.path.isfile(path):
         print(f"[msa] querying colabfold: {name} ({len(target_sequence)} aa)")
@@ -171,6 +314,21 @@ if sample_structure:
         cyclic_mask=cyclic_mask)
     salad_step = model_step(salad_config)
     sampler = si.Sampler(salad_step, out_steps=400)
+
+salad_ve_config = salad_ve_params = None
+if dock_blueprint:
+    import salad.inference as si
+    from copy import deepcopy
+    from salad.modules.utils.geometry import index_align
+    from flexcraft.pipelines.utils import bias_dssp
+    from flexcraft.pipelines.experimental._docked_salad import (
+        binder_step, parse_target, parse_hotspots, sample_centers_spaced, config_from_opt)
+
+    # NOTE: make_salad_model returns a SHARED, MUTABLE module-level config object (no copy).
+    # parse_target writes c.target_size onto it and si.data.from_config writes c.cyclic, so
+    # every target must get its own deepcopy before either is called.
+    salad_ve_config, salad_ve_params = si.make_salad_model(
+        "default_ve_scaled", opt.salad_ve_path)
 
 model = Joltz2(cache=opt.boltz_path)
 joltz_pred = model.predictor(num_recycle=4)
@@ -304,6 +462,93 @@ def _structure_comparison(design: DesignData, predicted_complex: DesignData) -> 
     )
 
 # ---------------------------------------------------------------------------------------
+# placement comparison (docked mode): did the hallucinated binder land on the epitope the
+# blueprint was docked to?
+#
+# Boltz never sees the blueprint's coordinates. The only channel from pose to hallucination is
+# the ProteinMPNN sequence, so these columns measure exactly "does a sequence designed for a
+# specific docked pose reproduce that pose?".
+# ---------------------------------------------------------------------------------------
+
+def epitope_mask(complex_data: DesignData, cutoff: float) -> np.ndarray:
+    """Per-target-residue bool: is this residue within `cutoff` of any binder residue?
+
+    Uses pseudo-CB (DesignData.cb -> positions_to_ncacocb, reconstructed from N/CA/C) rather
+    than real CB, because salad's and Boltz's sidechains are independently generated and would
+    inject noise. Boltz's own contact atom (boltz/_utils.py:74) is the same pseudo-CB.
+    Expects a BINDER-FIRST complex. Frame-invariant: computed within one structure, so it
+    needs no superposition.
+    """
+    cb = np.asarray(complex_data.cb)
+    d = np.linalg.norm(cb[binder_length:, None] - cb[None, :binder_length], axis=-1)
+    return d.min(axis=1) < cutoff
+
+def _epitope_agreement(bp_mask: np.ndarray, pred_mask: np.ndarray, suffix="") -> dict:
+    """Set agreement between two target-residue epitope masks.
+
+    Directions are pinned down in the names: recall is the fraction of the BLUEPRINT epitope
+    that the prediction recovered; precision is the fraction of the PREDICTED epitope that was
+    in the blueprint. Empty masks give 0.0 rather than NaN -- `_report_result` would otherwise
+    write "nan" -- and the n_* columns tell you which kind of zero it is.
+    """
+    inter = float((bp_mask & pred_mask).sum())
+    union = float((bp_mask | pred_mask).sum())
+    n_bp, n_pred = float(bp_mask.sum()), float(pred_mask.sum())
+    return {
+        f"epitope_jaccard{suffix}": np.float32(inter / union if union > 0 else 0.0),
+        f"epitope_recall_vs_blueprint{suffix}": np.float32(inter / n_bp if n_bp > 0 else 0.0),
+        f"epitope_precision_vs_blueprint{suffix}": np.float32(inter / n_pred if n_pred > 0 else 0.0),
+        f"n_epitope_blueprint{suffix}": np.float32(n_bp),
+        f"n_epitope_predicted{suffix}": np.float32(n_pred),
+    }
+
+def _placement_comparison(bp_complex: DesignData, predicted_complex: DesignData,
+                          hotspot_mask: np.ndarray, pos_center, target_size: int) -> dict:
+    """Compare where the blueprint put the binder against where the hallucination put it.
+
+    `bp_complex` must already be BINDER-FIRST and in the blueprint's target frame; see the
+    caller for the two fixes that guarantee that (chain reindexing and the atom_pos re-align).
+    """
+    n = bp_complex.size
+    assert predicted_complex.size == n, \
+        f"blueprint/prediction size mismatch: {n} vs {predicted_complex.size}"
+    tgt = np.arange(n) >= binder_length
+    w = tgt.astype(np.float32)
+
+    out = {}
+    for cutoff, suffix in ((opt.epitope_cutoff, ""), (opt.epitope_cutoff_2, "_10a")):
+        out.update(_epitope_agreement(
+            epitope_mask(bp_complex, cutoff),
+            epitope_mask(predicted_complex, cutoff), suffix=suffix))
+
+    # fraction of the REQUESTED hotspot residues the hallucinated binder actually contacts.
+    # hotspot_mask is positional over target residues, so it maps to complex rows by offset.
+    pred_ep = epitope_mask(predicted_complex, opt.epitope_cutoff)
+    if hotspot_mask is not None and hotspot_mask.any():
+        out["hotspot_recall"] = np.float32((pred_ep & hotspot_mask).sum() / hotspot_mask.sum())
+
+    # Target-frame superposition: weight=w makes index_kabsch use ONLY target rows for both
+    # the centroid and the covariance, so this is an exact target-only fit that still moves
+    # every atom. weight is NOT broadcast over atoms in RMSD.__call__ (rmsd.py:59-61), so
+    # atoms=["CA"] is mandatory here.
+    out["binder_rmsd_target_frame"] = RMSD(atoms=["CA"])(
+        predicted_complex, bp_complex, weight=w, eval_mask=~tgt)
+    # sanity: how well the two targets agree at all. A large value means the correspondence
+    # is broken, not that the binder moved.
+    out["target_fit_rmsd"] = RMSD(atoms=["CA"])(
+        predicted_complex, bp_complex, weight=w, eval_mask=tgt)
+
+    # binder centroid displacement, after putting the prediction in the blueprint's frame
+    aligned = predicted_complex.align_to(bp_complex, weight=w)
+    pred_c = np.asarray(aligned.ca)[:binder_length].mean(axis=0)
+    bp_c = np.asarray(bp_complex.ca)[:binder_length].mean(axis=0)
+    out["binder_centroid_drift"] = np.float32(np.linalg.norm(pred_c - bp_c))
+    # did salad honour the requested docking centre? Both are in the blueprint's target frame.
+    out["blueprint_center_offset"] = np.float32(
+        np.linalg.norm(bp_c - np.asarray(pos_center)))
+    return out
+
+# ---------------------------------------------------------------------------------------
 # reporting (landscape.py:303-325, plus hunter.py's leading `target` column)
 # ---------------------------------------------------------------------------------------
 
@@ -396,17 +641,46 @@ common_keys = [
     "L", "H", "E",
 ]
 blueprint_keys = ["rmsd_to_blueprint", "dssp_identity"]
+# Docked-mode placement columns. `rmsd_to_blueprint` (above) is a BINDER-ONLY superposition and
+# measures fold agreement; `binder_rmsd_target_frame` is a TARGET-frame superposition and
+# measures docking-site agreement. They are different quantities -- do not conflate them.
+placement_keys = ([
+    "epitope_jaccard", "epitope_recall_vs_blueprint", "epitope_precision_vs_blueprint",
+    "n_epitope_blueprint", "n_epitope_predicted",
+    "epitope_jaccard_10a", "epitope_recall_vs_blueprint_10a",
+    "epitope_precision_vs_blueprint_10a",
+    "n_epitope_blueprint_10a", "n_epitope_predicted_10a",
+    "hotspot_recall", "binder_rmsd_target_frame", "target_fit_rmsd",
+    "binder_centroid_drift", "blueprint_center_offset",
+] if dock_blueprint else [])
 string_keys = ["dssp_requested", "dssp_salad", "dssp_predicted"]
+if dock_blueprint:
+    string_keys = ["blueprint_mode", "hotspot_spec"] + string_keys
 
 trajectory = ScoreCSV(
     f"{opt.out_path}/trajectory.csv",
     keys=["target", "attempt", "step", "total"] + common_keys)
 results_keys = (
     ["target", "attempt", "stage", "target_length", "passed"]
-    + common_keys + blueprint_keys
+    + common_keys + blueprint_keys + placement_keys
     + ["sequence"] + string_keys)
 results = ScoreCSV(f"{opt.out_path}/results.csv", keys=results_keys)
 success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys)
+
+# The shuffled-pair null: epitope agreement between the blueprint of attempt i and the
+# prediction of attempt j (i != j) for the same target. Without it a Jaccard of 0.3 is
+# meaningless. Written once per target, after all its attempts finish. `center_distance` is
+# recorded so the null can be conditioned on how far apart the two docking sites were --
+# sample_centers_spaced is hotspot-biased, so different attempts often land on the same patch
+# and an unconditioned null would be inflated.
+placement_null = None
+if dock_blueprint:
+    placement_null = ScoreCSV(
+        f"{opt.out_path}/placement_null.csv",
+        keys=["target", "blueprint_attempt", "prediction_attempt", "stage",
+              "center_distance", "epitope_jaccard", "epitope_recall_vs_blueprint",
+              "n_epitope_blueprint", "n_epitope_predicted"])
+skipped = ScoreCSV(f"{opt.out_path}/skipped.csv", keys=["target", "reason"])
 
 # ---------------------------------------------------------------------------------------
 # sweep
@@ -414,28 +688,97 @@ success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys)
 
 key = None  # rebound per target
 
+# Populated per target when needed (dock_blueprint and/or target_use_template): name -> path
+# to that target's cached standalone-prediction PDB. Shared by the docked-blueprint setup
+# (parse_target reads it) and by --target_use_template (converted to a template CIF below).
+target_pdbs = {}
+# name -> template CIF path, only populated when --target_use_template True. _repredict and
+# the per-target joltz_spec builder both check membership in this dict to decide msa vs
+# template, so a target predicted only for docking (template off) still uses MSA as before.
+target_template_paths = {}
+
+def _predict_target_pdb(name: str, target_sequence: str) -> str:
+    """Predict the target's standalone structure once, cached by content hash. Needed by
+    --dock_blueprint (parse_target reads it) and/or --target_use_template (converted to a
+    template CIF below) -- called at most once per target regardless of which flags are set.
+    """
+    if name in target_pdbs:
+        return target_pdbs[name]
+    path = f"{target_pdb_dir}/{name}_{_seq_hash(target_sequence)}.pdb"
+    if not os.path.isfile(path):
+        print(f"[target] predicting structure for {name}")
+        spec = (JoltzSpec()
+                .add_protein(*target_sequence.split(":"))
+                .precomputed_msa(msa_paths[name], start_chain=0))
+        pred = joltz_pred(key(), spec)
+        # save_pdb, NOT save_cif: save_cif (boltz/_result.py:378) indexes
+        # samples[sample_index] unconditionally, but predictor output is single-sample
+        # (ndim 3), so it would slice the wrong axis.
+        pred.save_pdb(path)
+        del pred          # release the writer's TemporaryDirectory handle
+    else:
+        print(f"[target] cached structure: {path}")
+    target_pdbs[name] = path
+    return path
+
+def _target_template_cif(name: str, target_sequence: str) -> str:
+    """Cached template CIF for a target, built from its standalone-prediction PDB."""
+    if name in target_template_paths:
+        return target_template_paths[name]
+    pdb_path = _predict_target_pdb(name, target_sequence)
+    cif_path = f"{target_pdb_dir}/{name}_{_seq_hash(target_sequence)}_template.cif"
+    if not os.path.isfile(cif_path):
+        _pdb_to_template_cif(pdb_path, cif_path)
+    target_template_paths[name] = cif_path
+    return cif_path
+
 def _repredict(result: JoltzResult, name: str, target_sequence: str):
     """Full-atom re-prediction of the hardened binder against its target.
 
     A fresh JoltzSpec every call -- JoltzSpec mutates itself (add_* append to self.chains,
-    precomputed_msa/to_input flip chain["use_msa"] in place). No use_msa=True here: the
-    precomputed MSA covers the target, so this makes no network call.
+    precomputed_msa/to_input flip chain["use_msa"] in place).
     """
     binder_sequence = result.to_data().to_sequence_string()[:binder_length]
-    spec = (JoltzSpec()
-            .add_protein(binder_sequence)
-            .add_protein(*target_sequence.split(":"))
-            .precomputed_msa(msa_paths[name], start_chain=1))
+    spec = JoltzSpec().add_protein(binder_sequence).add_protein(*target_sequence.split(":"))
+    if use_target_template:
+        # to_chains names chains WITHIN the template file, not the complex -- it is currently
+        # a no-op in flexcraft/structure/boltz/_data.py (build_template_yaml writes the YAML
+        # key "template_chain_id", but boltz/data/parse/schema.py reads "template_id"), but is
+        # harmless to pass and documents intent. Correctness does not depend on it here: the
+        # template file (_predict_target_pdb's output) contains ONLY the target chain, and
+        # Boltz assigns templates to complex chains via a global sequence-alignment matching
+        # (linear_sum_assignment over all complex chains x all template chains), which always
+        # picks the target -- its sequence is literally identical to the template's, so it
+        # dominates the assignment regardless of what the binder chain looks like. Verified
+        # empirically: with a target-only template, 76/76 target tokens get template
+        # coordinates and 0/80 binder tokens do, for both a random and an all-X binder chain.
+        spec = spec.add_template(
+            _target_template_cif(name, target_sequence), to_chains=["A"])
+    else:
+        # No use_msa=True here: the precomputed MSA covers the target, so this makes no
+        # network call.
+        spec = spec.precomputed_msa(msa_paths[name], start_chain=1)
     return joltz_pred(key(), spec)
 
 def _report_stage(name, attempt, stage, sequence, prediction, design,
-                  dssp_requested, target_length):
-    """metrics() + blueprint comparison -> one results.csv row. Returns the aux dict."""
+                  dssp_requested, target_length,
+                  bp_complex=None, hotspot_mask=None, pos_center=None,
+                  target_size=None, hotspot_spec=None):
+    """metrics() + blueprint comparison (+ placement comparison in docked mode)
+    -> one results.csv row. Returns the aux dict."""
     result = prediction.result
     aux = metrics(sequence, key(), result)
     if design is not None:
         aux.update(_structure_comparison(design, result.to_data()))
         aux["dssp_requested"] = dssp_requested
+    if bp_complex is not None:
+        # a fresh to_data() each time: _structure_comparison's guard asserts no cached DSSP
+        aux.update(_placement_comparison(
+            bp_complex, result.to_data(), hotspot_mask, pos_center, target_size))
+        aux["blueprint_mode"] = "docked"
+        aux["hotspot_spec"] = _compact_spec(hotspot_spec)
+    elif dock_blueprint:
+        aux["blueprint_mode"] = "free"
     aux["target_length"] = str(target_length)
     aux["passed"] = "True" if _passing(aux) else "False"
     return _report_result(name, attempt, stage, key(), results,
@@ -448,16 +791,100 @@ for name, target_sequence in targets:
     # Reseed per target so a single target's attempts are reproducible in isolation
     # (a shared global stream would make target k depend on how many keys 0..k-1 drew,
     # so --only_targets would not reproduce the full sweep).
-    key = Keygen(opt.seed + int(hashlib.sha256(name.encode()).hexdigest()[:8], 16) % 100000)
+    target_seed = opt.seed + int(hashlib.sha256(name.encode()).hexdigest()[:8], 16) % 100000
+    key = Keygen(target_seed)
+    # pos_center selection, sample_centers_spaced and si.random_dssp all draw from the global
+    # numpy RNG, so per-target reproducibility needs this too, not just the Keygen.
+    np.random.seed(target_seed % (2 ** 32))
 
     joltz_spec = (JoltzSpec()
         .add_protein("X" * binder_length)            # chain A: designable binder
-        .add_protein(*target_sequence.split(":"))    # chain B..: the target
-        .precomputed_msa(msa_paths[name], start_chain=1))
+        .add_protein(*target_sequence.split(":")))   # chain B..: the target
+    if use_target_template:
+        # Static conditioning, exactly like precomputed_msa below: to_input() bakes the
+        # template features into params["joltz_input"] once; nothing about them is
+        # differentiable, so this is safe to use inside the hallucination loss too.
+        joltz_spec = joltz_spec.add_template(
+            _target_template_cif(name, target_sequence), to_chains=["A"])
+    else:
+        joltz_spec = joltz_spec.precomputed_msa(msa_paths[name], start_chain=1)
     params["joltz_input"], _ = joltz_spec.to_input(pad=False, cache=opt.boltz_path)
     target_length = len(target_sequence.replace(":", ""))
     print(f"=== target {name} ({target_length} aa), "
-          f"complex tokens = {binder_length + target_length} ===")
+          f"complex tokens = {binder_length + target_length} "
+          f"[{'template' if use_target_template else 'msa'}] ===")
+
+    # ---- docked-blueprint setup, once per target -------------------------------------
+    docked = None
+    if dock_blueprint:
+        flat_target = target_sequence.replace(":", "")
+        # 1. target structure, predicted once and cached by content hash. Shared with
+        #    --target_use_template above via _predict_target_pdb's cache, so this is a no-op
+        #    (dict lookup) when that flag already triggered the prediction for this target.
+        tgt_pdb = _predict_target_pdb(name, target_sequence)
+
+        # 2. per-target config deepcopy -- make_salad_model returns a SHARED mutable object,
+        #    and parse_target writes c.target_size onto it. config_from_opt must run BEFORE
+        #    binder_step, which deepcopies the config at closure-creation time.
+        config_t = deepcopy(salad_ve_config)
+        init_data, init_prev_t, target_center, is_target, target_size = parse_target(
+            config_t, tgt_pdb, binder_length)
+        config_t = config_from_opt(config_t, opt)
+
+        # 3. correspondence assert. The epitope mask and the target-frame RMSD are POSITIONAL
+        #    (neither reads residue_index), so what matters is that the blueprint target rows
+        #    are the same residues, in the same order, as the Boltz complex's target rows.
+        #    from_pdb_string silently drops residues with no resolvable atoms and maps
+        #    non-standard residues to aatype 20, either of which would shift every row.
+        bp_target_seq = aas.decode(
+            np.asarray(init_data["aa_condition"][:target_size]), aas.AF2_CODE)
+        assert target_size == len(flat_target) and bp_target_seq == flat_target, (
+            f"{name}: blueprint target does not match the fasta target.\n"
+            f"  parsed  ({target_size}): {bp_target_seq}\n"
+            f"  fasta   ({len(flat_target)}): {flat_target}\n"
+            f"Residues may have been dropped by from_pdb_string, or the PDB is stale.")
+
+        # 4. hotspots -> candidate binder-centroid positions
+        spec_str = hotspot_specs[name]
+        hotpos, coldpos, hotspot_mask, _ = parse_hotspots(init_data, spec_str, "none")
+        n_requested = len(spec_str.split(","))
+        assert hotspot_mask.any(), (
+            f"{name}: none of the {n_requested} requested hotspots matched a target residue. "
+            f"Hotspot numbering is 1-based over the fasta sequence and the predicted target "
+            f"is chain A. Without this check an unmatched spec is indistinguishable from an "
+            f"undockable target (both end in pos_centers=None).")
+        print(f"[hotspot] {name}: matched {int(hotspot_mask.sum())} of {n_requested} residues")
+
+        target_ca = init_data["pos"][is_target][:, 1]
+        pos_centers = sample_centers_spaced(
+            target_ca, hotpos,
+            radius_min=opt.radius, clash_radius=opt.clash_radius,
+            min_distance=opt.min_center_distance,
+            coldspot_radius=opt.coldspot_radius, coldpos=coldpos)
+        if pos_centers is None or len(pos_centers) == 0:
+            print(f"[skip] {name}: no viable docking centres for this hotspot")
+            skipped.write_line(dict(target=name, reason="no_docking_centres"))
+            continue
+        print(f"[hotspot] {name}: {len(pos_centers)} candidate docking centres")
+
+        # 5. secondary-structure bias: set ONCE per target, unconditionally. bias_dssp only
+        #    writes its keys when a bias is > 0, so setting it per attempt would (a) let a
+        #    previous attempt's bias persist and (b) change the pytree mid-loop, forcing a
+        #    second salad compile.
+        init_data = bias_dssp(init_data, L=opt.l_bias, H=opt.h_bias, E=opt.e_bias,
+                              where=~is_target)
+        # 6. sampler hoisted to the target loop: si.Sampler.__init__ jits its step and
+        #    binder_step returns a fresh function object, so building either per attempt
+        #    would recompile salad every attempt.
+        sampler_t = si.Sampler(
+            binder_step(config_t), prev_threshold=opt.prev_threshold,
+            out_steps=400, timescale="ve(t, sigma_max=80.0)")
+        docked = dict(
+            init_data=init_data, init_prev=init_prev_t, is_target=is_target,
+            target_size=target_size, pos_centers=pos_centers,
+            hotspot_mask=np.asarray(hotspot_mask), sampler=sampler_t, spec=spec_str)
+        # per-attempt epitope masks, for the shuffled-pair null at the end of this target
+        null_rows = []
 
     for attempt in range(opt.attempts_per_target):
         context = dict(recovery=10.0, ipae=0.05)
@@ -465,7 +892,75 @@ for name, target_sequence in targets:
         # ---- a fresh salad backbone per attempt --------------------------------------
         design = None
         dssp_requested = "none"
-        if sampler is not None:
+        bp_complex = None
+        pos_center = None
+        if docked is not None:
+            init_data = docked["init_data"]
+            is_target = docked["is_target"]
+            target_size = docked["target_size"]
+            # pick a docking centre and collapse the binder onto it (bind/__main__.py:131-134).
+            # Safe to mutate init_data across attempts: si.inference.sampling.sample
+            # shallow-copies the dict on entry (sampling.py:60) before writing data["pos"],
+            # so the sampler never touches the target rows we keep here.
+            pos_center = docked["pos_centers"][
+                np.random.randint(0, len(docked["pos_centers"]))]
+            init_data["center"] = jnp.asarray(pos_center, dtype=jnp.float32)
+            init_data["pos"] = jnp.where(
+                is_target[:, None, None], init_data["pos"], jnp.asarray(pos_center))
+            salad_out = docked["sampler"](
+                salad_ve_params, key(), init_data, docked["init_prev"])
+            bp_complex = data_from_salad(salad_out)
+
+            # FRAME FIX. binder_step aligns only out["pos"] onto the target
+            # (_docked_salad.py, index_align with weight=is_target), but salad builds
+            # out["atom_pos"] independently from the PRE-alignment pos
+            # (noise_schedule_benchmark.py:1115), and data_from_salad reads atom_pos. So the
+            # blueprint comes back in a different frame from init_data["pos"] -- off by the
+            # joint-centroid recentring (~5 A) plus a rotation. Put it back in the target
+            # frame, which is the frame pos_center and hotpos live in. index_align computes
+            # the Kabsch from CA only (x[:, 1]), so the atom14/atom-5+augment width
+            # difference is fine.
+            n_complex = bp_complex.size
+            bp_complex = bp_complex.update(atom_positions=index_align(
+                bp_complex["atom_positions"], init_data["pos"],
+                index=jnp.zeros((n_complex,), dtype=jnp.int32),
+                mask=jnp.ones((n_complex,), dtype=jnp.bool_),
+                weight=jnp.asarray(is_target, dtype=jnp.float32)))
+
+            # ProteinMPNN over the FULL complex with the target sequence fixed. This is the
+            # step that makes the experiment meaningful: interface residues get designed for
+            # THIS epitope, so the sequence is the channel carrying the pose. Use
+            # aa_condition (native target + 20s), not bp_complex["aa"] -- salad predicts its
+            # own sequence and we want the real target identity.
+            mpnn_aa = jnp.where(
+                jnp.asarray(is_target),
+                aas.translate(jnp.asarray(init_data["aa_condition"]),
+                              aas.AF2_CODE, aas.PMPNN_CODE),
+                20)
+            logits = jit_pmpnn(
+                pmpnn_params, key(), bp_complex.update(aa=mpnn_aa))["logits"]
+            logits = aas.translate_onehot(logits, aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
+            # target-FIRST layout: the binder is the tail
+            sequence = jax.nn.softmax(
+                logits[~is_target] / opt.init_temperature, axis=-1)
+
+            # binder-only blueprint for the existing fold comparison, sliced BEFORE any .dssp
+            # access so it never inherits complex-context DSSP
+            design = bp_complex[~jnp.asarray(is_target)]
+            # reorder the blueprint to BINDER-FIRST to match Boltz. The binder must be
+            # explicitly re-chained to 0: _sep_groups (data.py:516-523) leaves the FIRST
+            # item's chain_index untouched, so `binder / target` with binder chain 1 would
+            # give chains 1 and 2, and `chain_index == 0` would match nothing.
+            bp_binder = design.update(
+                chain_index=jnp.zeros_like(design.chain_index))
+            bp_complex = bp_binder / bp_complex[jnp.asarray(is_target)]
+            # Save AFTER the reorder so the blueprint PDB has the same chain layout as the
+            # attempt PDBs (A = binder, B = target). Saving the target-first form made the
+            # two files disagree, which broke naive overlays in PyMOL and forced
+            # scripts/epitope_report.py to detect chains by sequence.
+            bp_complex.save_pdb(
+                f"{opt.out_path}/blueprints/{name}_{attempt}_complex.pdb")
+        elif sampler is not None:
             salad_data["dssp_condition"], dssp_requested = si.random_dssp(
                 num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
             print("DSSP target:", dssp_requested)
@@ -497,8 +992,14 @@ for name, target_sequence in targets:
             report=_report_trajectory(name, attempt, trajectory, start_step=0))
         sequence_1 = sequence
         prediction_1 = _repredict(aux["result"], name, target_sequence)
+        placement_kw = dict(
+            bp_complex=bp_complex,
+            hotspot_mask=None if docked is None else docked["hotspot_mask"],
+            pos_center=pos_center,
+            target_size=None if docked is None else docked["target_size"],
+            hotspot_spec=None if docked is None else docked["spec"])
         stage_1 = _report_stage(name, attempt, "stage_1", sequence_1, prediction_1,
-                                design, dssp_requested, target_length)
+                                design, dssp_requested, target_length, **placement_kw)
         prediction_1.save_pdb(f"{opt.out_path}/attempts/{name}_{attempt}_stage_1.pdb")
 
         # ---- stage 2: logit-space hardening ------------------------------------------
@@ -517,8 +1018,18 @@ for name, target_sequence in targets:
         sequence_2 = sequence
         prediction_2 = _repredict(aux["result"], name, target_sequence)
         stage_2 = _report_stage(name, attempt, "stage_2", sequence_2, prediction_2,
-                                design, dssp_requested, target_length)
+                                design, dssp_requested, target_length, **placement_kw)
         prediction_2.save_pdb(f"{opt.out_path}/attempts/{name}_{attempt}_stage_2.pdb")
+
+        # keep this attempt's epitope masks for the shuffled-pair null, computed once all
+        # attempts for this target are done
+        if docked is not None:
+            null_rows.append(dict(
+                attempt=attempt,
+                center=np.asarray(pos_center),
+                bp=epitope_mask(bp_complex, opt.epitope_cutoff),
+                pred_1=epitope_mask(prediction_1.result.to_data(), opt.epitope_cutoff),
+                pred_2=epitope_mask(prediction_2.result.to_data(), opt.epitope_cutoff)))
 
         # ---- stage selection ----------------------------------------------------------
         stage, chosen, prediction, sequence = "stage_2", stage_2, prediction_2, sequence_2
@@ -528,5 +1039,26 @@ for name, target_sequence in targets:
             _report_result(name, attempt, stage, key(), success,
                            sequence, prediction.result, aux=chosen)
             prediction.save_pdb(f"{opt.out_path}/success/{name}_{attempt}_{stage}.pdb")
+
+    # ---- shuffled-pair null for this target ------------------------------------------
+    # Blueprint of attempt i vs prediction of attempt j (i != j). Without this the matched
+    # epitope Jaccard has no baseline. center_distance is recorded because
+    # sample_centers_spaced is hotspot-biased by construction: different attempts often land
+    # on the same patch, which inflates the null. Condition on it when analysing.
+    if docked is not None and len(null_rows) > 1:
+        for a in null_rows:
+            for b in null_rows:
+                if a["attempt"] == b["attempt"]:
+                    continue
+                dist = float(np.linalg.norm(a["center"] - b["center"]))
+                for stage_name, pred_key in (("stage_1", "pred_1"), ("stage_2", "pred_2")):
+                    agree = _epitope_agreement(a["bp"], b[pred_key])
+                    placement_null.write_line(dict(
+                        target=name,
+                        blueprint_attempt=a["attempt"],
+                        prediction_attempt=b["attempt"],
+                        stage=stage_name,
+                        center_distance=round(dist, 3),
+                        **{k: float(v) for k, v in agree.items()}))
 
 print(f"done. combined results: {opt.out_path}/results.csv")

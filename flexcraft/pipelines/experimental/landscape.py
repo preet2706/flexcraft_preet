@@ -20,6 +20,7 @@ from flexcraft.utils import Keygen, parse_options, data_from_salad
 from flexcraft.files import ScoreCSV, PDBFile
 from flexcraft.structure.boltz import Joltz2, JoltzInput, JoltzResult, JoltzSpec
 from flexcraft.hallucination.opt import jit_loss_update, simplex_agpm
+from flexcraft.hallucination.losses.distogram import blueprint_distogram, distogram_nll
 from flexcraft.data.data import DesignData
 from flexcraft.pipelines.utils import bias_dssp
 
@@ -78,10 +79,15 @@ opt = parse_options(
     l_bias=0.0,
     h_bias=0.0,
     e_bias=0.0,
+    distogram_loss_weights="0.0",
     seed=42
 )
+def _float_list(s: str) -> list:
+    return [float(v) for v in s.split(",") if v.strip() != ""]
+
 hallucinate = opt.hallucinate == "True"
 avg_init = opt.avg_init == "True"
+distogram_loss_weights = _float_list(opt.distogram_loss_weights)
 use_bias = (opt.l_bias > 0.0) or (opt.h_bias > 0.0) or (opt.e_bias > 0.0)
 init_batch_size = opt.init_batch_size if avg_init else 1
 assert init_batch_size >= 1, "--init_batch_size must be >= 1"
@@ -309,7 +315,7 @@ def metrics(sequence, key, result: JoltzResult):
     if not result.is_single_sample:
         plddt = plddt.mean(axis=0)
         pae = pae.mean(axis=0)
-    return dict(
+    out = dict(
         logits = logits,
         entropy = entropy,
         plddt = plddt.mean(),
@@ -320,6 +326,9 @@ def metrics(sequence, key, result: JoltzResult):
         L = dssp["L"], H = dssp["H"], E = dssp["E"],
         ptm = result.ptm,
     )
+    if "target_distogram" in params:
+        out["distogram_nll"] = distogram_nll(result, params["target_distogram"])
+    return out
 
 def dssp_to_string(dssp_array) -> str:
     """Convert an int DSSP array (0=loop, 1=helix, 2=strand) to an 'LHE' string."""
@@ -449,6 +458,10 @@ def loss(sequence, key=None, context=None, params=None):
         + 0.4 * out["pae"]
         - 0.1 * out["plddt"]
     )
+    distogram_weight = params.get("distogram_loss_weight", 0.0)
+    if "distogram_nll" in out:
+        value = value + distogram_weight * out["distogram_nll"]
+    out["distogram_loss_weight"] = distogram_weight
     out["total"] = value
     return value, out
 loss_update = jit_loss_update(loss)
@@ -465,6 +478,8 @@ common_keys = [
     "recovery",
     "contacts",
     "pae",
+    "distogram_nll",
+    "distogram_loss_weight",
     "average_num_nonzero",
     "L", "H", "E",
     "ptm",
@@ -484,6 +499,43 @@ results_keys = [
 ] if avg_init else [])
 results = ScoreCSV(f"{opt.out_path}/results.csv", keys=results_keys)
 success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys)
+
+def _hallucinate_once(attempt, sequence, params, context, designs, init_diagnostics, weight=None):
+    """Run one hallucination optimization (loss_update init call + simplex_agpm + final
+    prediction/report) starting from `sequence`. `weight` is only used to tag output
+    filenames/CSV rows -- reassigning `sequence` here does not affect the caller's copy,
+    so calling this repeatedly with the same outer `sequence` (e.g. once per
+    distogram_loss_weight, against the same blueprint) restarts optimization from the same
+    starting distribution each time."""
+    suffix = f"_w{weight}" if weight is not None else ""
+    (_, aux), _ = loss_update(sequence, key=key(), params=params)
+    aux_data: DesignData = aux["result"].to_data()
+    aux_data.save_pdb(f"{opt.out_path}/attempts/design_{attempt}{suffix}_init.pdb")
+    sequence, loss_val, aux = simplex_agpm(
+        sequence, loss_update, key=key, params=params, context=context,
+        num_steps=50,
+        lr=0.1 * jnp.sqrt(sequence.shape[0]), momentum=0.3,
+        scale=1.0,
+        grad_transform=optax.clip_by_global_norm(1.0),
+        param_transform=lambda x: x.at[:, aas.AF2_CODE.index("C")].set(0.0),
+        verbose=True, return_last=False,
+        early_stop=None,
+        report=_report_trajectory(attempt, trajectory, start_step=0))
+    result = aux["result"]
+    data = result.to_data()
+    hardened_sequence = data.to_sequence_string()
+    prediction_1 = joltz_pred(key(), JoltzSpec().add_protein(hardened_sequence))
+    final_result: JoltzResult = prediction_1.result
+    predicted_data = final_result.to_data()
+    report_aux = metrics(sequence, key(), final_result)
+    report_aux.update(_structure_comparison_batch(designs, predicted_data))
+    report_aux["init"] = "soft"
+    if weight is not None:
+        report_aux["distogram_loss_weight"] = np.float32(weight)
+    report_aux.update(_init_provenance())
+    report_aux.update(init_diagnostics)
+    _report_result(attempt, "stage_1", key(), results, sequence, final_result, aux=report_aux)
+    prediction_1.save_pdb(f"{opt.out_path}/attempts/design_{attempt}{suffix}.pdb")
 
 success_count = 0
 attempt = 0
@@ -515,6 +567,7 @@ while success_count < opt.num_designs:
         salad_design = sampler(salad_params, key(), salad_data, init_prev)
         design = data_from_salad(salad_design)
         design.save_pdb(f"{opt.out_path}/blueprints/design_{attempt}.pdb")
+        params["target_distogram"] = blueprint_distogram(design)
         sequence = aas.translate_onehot(
             pmpnn(key(), design.drop_aa())["logits"],
             aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
@@ -530,32 +583,15 @@ while success_count < opt.num_designs:
              if "batch_rmsd_to_ref" in init_diagnostics else ""))
 
     if hallucinate:
-        (_, aux), _ = loss_update(sequence, key=key(), params=params)
-        aux_data: DesignData = aux["result"].to_data()
-        aux_data.save_pdb(f"{opt.out_path}/attempts/design_{attempt}_init.pdb")
-        sequence, loss_val, aux = simplex_agpm(
-            sequence, loss_update, key=key, params=params, context=context,
-            num_steps=50,
-            lr=0.1 * jnp.sqrt(sequence.shape[0]), momentum=0.3,
-            scale=1.0,
-            grad_transform=optax.clip_by_global_norm(1.0),
-            param_transform=lambda x: x.at[:, aas.AF2_CODE.index("C")].set(0.0),
-            verbose=True, return_last=False,
-            early_stop=None,
-            report=_report_trajectory(attempt, trajectory, start_step=0))
-        result = aux["result"]
-        data = result.to_data()
-        hardened_sequence = data.to_sequence_string()
-        prediction_1 = joltz_pred(key(), JoltzSpec().add_protein(hardened_sequence))
-        final_result: JoltzResult = prediction_1.result
-        predicted_data = final_result.to_data()
-        report_aux = metrics(sequence, key(), final_result)
-        report_aux.update(_structure_comparison_batch(designs, predicted_data))
-        report_aux["init"] = "soft"
-        report_aux.update(_init_provenance())
-        report_aux.update(init_diagnostics)
-        _report_result(attempt, "stage_1", key(), results, sequence, final_result, aux=report_aux)
-        prediction_1.save_pdb(f"{opt.out_path}/attempts/design_{attempt}.pdb")
+        if avg_init:
+            _hallucinate_once(attempt, sequence, params, context, designs, init_diagnostics)
+        else:
+            # Sweep distogram_loss_weight against the SAME blueprint/target_distogram
+            # (set once per attempt above), restarting from the same initial `sequence`
+            # for each weight.
+            for w in distogram_loss_weights:
+                params["distogram_loss_weight"] = w
+                _hallucinate_once(attempt, sequence, params, context, designs, init_diagnostics, weight=w)
     else:
         hard_sequence = jax.nn.one_hot(jnp.argmax(sequence, axis=-1), 20)
         for init_label, seq_variant in (("soft", sequence), ("hard", hard_sequence)):

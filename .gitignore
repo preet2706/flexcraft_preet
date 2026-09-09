@@ -15,3 +15,4 @@ CLAUDE.md
 runs/
 bash_scripts/
 slurm_logs/
+.jax_cache/

@@ -325,6 +325,77 @@ def fig_crossmetric(results, out_path, run_name):
     return path
 
 
+# ---------------------------------------------------------------------------------------
+# 5. placement (docked mode only): did the binder land on the blueprint's epitope?
+# ---------------------------------------------------------------------------------------
+
+def fig_placement(results, null, out_path, run_name):
+    """Matched vs shuffled epitope agreement, plus what placement correlates with.
+
+    The headline is the LEFT panel: matched Jaccard minus the shuffled-pair null. If the two
+    distributions overlap, the docked blueprint is not biasing where the binder lands.
+    """
+    matched = results["epitope_jaccard"].dropna().to_numpy(float)
+    shuffled = null["epitope_jaccard"].dropna().to_numpy(float) if null is not None else np.array([])
+
+    fig, axes = plt.subplots(1, 4, figsize=(19, 5.0))
+
+    ax = axes[0]
+    _kde(ax, matched, GREEN, "matched (blueprint i -> prediction i)")
+    if shuffled.size:
+        _kde(ax, shuffled, "#B0B0B0", "shuffled (blueprint i -> prediction j)")
+    ax.set_title("Epitope agreement vs the null")
+    ax.set_xlabel("epitope Jaccard")
+    ax.set_yticks([]); ax.spines["left"].set_visible(False)
+    if shuffled.size:
+        delta = matched.mean() - shuffled.mean()
+        ax.text(0.97, 0.95,
+                f"matched {matched.mean():.3f}\nshuffled {shuffled.mean():.3f}\n"
+                f"$\\Delta$ = {delta:+.3f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=9,
+                bbox=dict(fc="#F2F2F2", ec="none", pad=3))
+
+    # the null is hotspot-biased by construction, so condition it on centre separation
+    ax = axes[1]
+    if null is not None and "center_distance" in null:
+        ax.scatter(null["center_distance"], null["epitope_jaccard"],
+                   s=14, alpha=0.35, color="#B0B0B0", linewidths=0, label="shuffled")
+        ax.axhline(matched.mean(), color=GREEN, lw=1.8, ls="--", label="matched mean")
+        ax.set_xlabel("distance between the two docking centres (Å)")
+        ax.set_ylabel("epitope Jaccard")
+        ax.set_title("Null, conditioned on centre separation")
+        ax.legend(frameon=False, fontsize=8.5)
+
+    for ax, (xc, xl) in zip(axes[2:], [
+            ("binder_centroid_drift", "binder centroid drift (Å)"),
+            ("blueprint_center_offset", "blueprint centre offset (Å)")]):
+        if xc not in results:
+            ax.set_visible(False)
+            continue
+        for mask, color, lab in [(~results.passed, "#C3C3C3", "fail"),
+                                 (results.passed, GREEN, "pass")]:
+            sub = results[mask]
+            ax.scatter(sub[xc], sub["epitope_jaccard"], s=20,
+                       alpha=0.5 if lab == "fail" else 0.8, color=color, linewidths=0)
+        x = results[xc].to_numpy(float); y = results["epitope_jaccard"].to_numpy(float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        r = pearsonr(x[ok], y[ok])[0] if ok.sum() > 2 and x[ok].std() > 0 else np.nan
+        ax.set_xlabel(xl); ax.set_ylabel("epitope Jaccard")
+        ax.set_title(f"r = {r:.2f}" if np.isfinite(r) else "")
+
+    fig.suptitle(f"Docked-blueprint placement: does the blueprint steer the binder?   "
+                 f"({run_name})", fontsize=15, y=0.985)
+    _dot_legend(fig, [("matched", GREEN), ("shuffled null / fail", "#B0B0B0")], y=0.905)
+    _footnote(fig, "Epitope = target residues within the cutoff of any binder residue "
+                   "(pseudo-CB). The shuffled null pairs each blueprint with another "
+                   "attempt's prediction for the same target.")
+    fig.tight_layout(rect=[0, 0.04, 1, 0.87])
+    path = os.path.join(out_path, "mosaic_scan_placement.png")
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -339,11 +410,17 @@ def main():
     print(f"loaded {len(results)} rows, {results.target.nunique()} targets, "
           f"{len(success) if success is not None else 0} successes")
 
-    p1 = fig_metrics(results, out_path, run_name)
+    paths = [fig_metrics(results, out_path, run_name)]
     p2, rate, yield_n, attempts = fig_targets(results, success, out_path, run_name)
-    p3 = fig_stage_scatter(results, out_path, run_name)
-    p4 = fig_crossmetric(results, out_path, run_name)
-    for p in (p1, p2, p3, p4):
+    paths.append(p2)
+    paths.append(fig_stage_scatter(results, out_path, run_name))
+    paths.append(fig_crossmetric(results, out_path, run_name))
+    # docked runs only: the placement columns are absent from a free-monomer run
+    if "epitope_jaccard" in results.columns:
+        null_path = os.path.join(args.run_path, "placement_null.csv")
+        null = pd.read_csv(null_path) if os.path.isfile(null_path) else None
+        paths.append(fig_placement(results, null, out_path, run_name))
+    for p in paths:
         print("wrote", p)
 
     print("\nper-target yield:")
