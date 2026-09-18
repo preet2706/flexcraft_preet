@@ -9,8 +9,8 @@ import numpy as np
 import jax
 import haiku as hk
 
-from colabdesign.af.alphafold.model.config import model_config
-from colabdesign.af.alphafold.model.data import get_model_haiku_params
+from flexcraft.structure._colab_af.alphafold.model.config import model_config
+from flexcraft.structure._colab_af.alphafold.model.data import get_model_haiku_params
 
 import optax
 
@@ -22,7 +22,7 @@ from flexcraft.data.data import DesignData
 from flexcraft.sequence.mpnn import make_pmpnn
 import flexcraft.sequence.aa_codes as aas
 from flexcraft.hallucination.opt import jit_loss_update, simplex_agpm
-from flexcraft.structure.boltz._model import Joltz2, JoltzResult, Joltz2Writer
+from flexcraft.structure.boltz._model import Joltz2, JoltzResult
 from flexcraft.structure.boltz._data import JoltzSpec, JoltzInput
 from flexcraft.structure.af import AFInput, AFResult, make_af2, make_predict
 from flexcraft.files.csv import ScoreCSV
@@ -59,6 +59,9 @@ opt = parse_options(
     model_name="model_1_ptm",
     param_path="params/af",
     sample_structure="False",
+    inter_contact_distance=20.0,
+    intra_contact_distance=14.0,
+    hotspot_distance=0.0,
     num_designs=48,
     length=80,
     repeat=1,
@@ -150,7 +153,7 @@ if opt.predict_template == "True":
 # unknown-aa hallucination model
 if opt.hallucination_model == "joltz":
     joltz, joltz_params = model.evaluator(num_recycle=4)
-    if opt.target_template != "none":
+    if target_template != "none":
         joltz_spec = (
             # start with empty spec
             JoltzSpec()
@@ -253,12 +256,18 @@ def metrics(sequence, key, result: JoltzResult):
     hotspot_contacts = (
         result.index_contact_score(
             binder_selector, hotspot_selector, # NOTE: flip target and binder here
-            num_contacts=3, contact_distance=20.0)
+            num_contacts=3, contact_distance=opt.inter_contact_distance)
       + result.index_contact_score(
             hotspot_selector, binder_selector, # NOTE: flip target and binder here
-            num_contacts=3, contact_distance=20.0)
+            num_contacts=3, contact_distance=opt.inter_contact_distance)
     ) / 2
-    binder_target_contacts = result.chain_contact_score(1, 0, num_contacts=3, contact_distance=20.0)
+    distance_map = (result.distogram * result.distogram_bin_centers).sum(axis=-1)
+    hotspot_distance_mask = hotspot_selector[:, None] * binder_selector[None, :]
+    distance_map = jnp.where(hotspot_distance_mask, distance_map, 0.0)
+    # hotspot_distance = -jax.nn.logsumexp(-distance_map, axis=1)
+    hotspot_distance = distance_map.sum() / jnp.maximum(1, hotspot_distance_mask.sum())
+    binder_target_contacts = result.chain_contact_score(
+        1, 0, num_contacts=3, contact_distance=opt.inter_contact_distance)
     if hotspot_index is not None:
         binder_target_contacts = hotspot_contacts
     return dict(
@@ -269,6 +278,7 @@ def metrics(sequence, key, result: JoltzResult):
         binder_target_contacts = binder_target_contacts,
         within_binder_contacts = result.chain_contact_score(0, 0, num_contacts=25, min_resi_distance=10),
         hotspot_contacts = hotspot_contacts,
+        hotspot_distance = hotspot_distance,
         within_binder_pae = pae[:binder_length, :binder_length].mean(),
         binder_target_pae = pae[:binder_length, binder_length:].mean(),
         target_binder_pae = pae[binder_length:, :binder_length].mean(),
@@ -380,6 +390,8 @@ def loss(sequence, key=kval, context=None, params=None):
         - 0.025 * out["iptm"]
         - 0.025 * out["eptm"]
     )
+    if opt.hotspot_distance > 0:
+        value += opt.hotspot_distance * out["hotspot_distance"]
     if "off_input" in params:
         value += (
             # also impacts on-target recovery

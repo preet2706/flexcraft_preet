@@ -5,7 +5,7 @@ import shutil
 import time
 import uuid
 
-from flexcraft.utils import load_pdb
+from flexcraft.utils.io import load_pdb
 from flexcraft.data.data import DesignData
 
 class PDBFile:

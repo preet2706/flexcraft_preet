@@ -1,36 +1,22 @@
 import os
-import shutil
 import gemmi
 from copy import deepcopy
-import random
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from Bio.SeqUtils.IsoelectricPoint import IsoelectricPoint as IP
-
 import salad.inference as si
-from salad.modules.utils.dssp import assign_dssp
-from salad.inference.symmetry import Screw
 from salad.modules.utils.geometry import index_mean, index_align
 
 from flexcraft.utils import *
-from flexcraft.sequence.mpnn import make_pmpnn
 from flexcraft.sequence.sample import *
 from flexcraft.structure.af import *
-from flexcraft.structure.metrics import RMSD
-from flexcraft.data.data import DesignData
 from flexcraft.files.csv import ScoreCSV
-from flexcraft.files.pdb import PDBFile
-from flexcraft.protocols import af_cycler
-from flexcraft.protocols.bindcraft_filter import BindCraftProperties
 
 from salad.aflib.common.protein import from_pdb_string
 from salad.modules.utils.geometry import positions_to_ncacocb
-
-import pyrosetta as pr
 
 # salad model step for binder design
 def binder_step(config):

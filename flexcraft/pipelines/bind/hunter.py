@@ -1,28 +1,21 @@
 # Protein Hunter-like binder design script
 
 import os
-import time
 import uuid
 import numpy as np
 import jax
-import haiku as hk
 
-from colabdesign.af.alphafold.model.config import model_config
-from colabdesign.af.alphafold.model.data import get_model_haiku_params
-
-import optax
 
 from flexcraft.utils.options import parse_options
 from flexcraft.utils.rng import Keygen
-from flexcraft.utils import Keygen, parse_options, load_pdb, strip_aa, tie_homomer
+from flexcraft.utils import Keygen, parse_options
 from flexcraft.sequence.sample import *
 from flexcraft.data.data import DesignData
 from flexcraft.sequence.mpnn import make_pmpnn
 import flexcraft.sequence.aa_codes as aas
-from flexcraft.structure.boltz._model import Joltz2, JoltzResult, Joltz2Writer
+from flexcraft.structure.boltz._model import Joltz2, JoltzResult
 from flexcraft.structure.boltz._data import JoltzSpec, JoltzInput
 from flexcraft.structure.boltz._result import JoltzPrediction
-from flexcraft.structure.af import AFInput, AFResult, make_af2, make_predict
 from flexcraft.files import FastaFile, ScoreCSV
 
 opt = parse_options(
@@ -32,6 +25,7 @@ opt = parse_options(
     name="target",
     use_msa="True",
     out_path="out",
+    save_features="False",
     boltz_path="params/boltz/",
     num_designs=48,
     length=80,
@@ -89,7 +83,7 @@ def protein_hunter(key, cycles=5):
             aa=aas.translate(pmpnn_result["aa"], aas.PMPNN_CODE, aas.AF2_CODE))
         return pmpnn_result.to_sequence_string().split(":")[0]
     def _inner(target_sequence: str, binder_length: int, init_input=None,
-               template=None, use_msa=True, report=None) -> JoltzResult:
+               template=None, use_msa=True, report=None) -> JoltzPrediction:
         spec = (
             JoltzSpec()
             .add_protein(binder_length * "X")
@@ -186,4 +180,6 @@ for name, sequence in sequences.items():
             use_msa=opt.use_msa == "True",
             template=target_template,
             report=_report_trajectory(name, attempt, trajectory))
+        if opt.save_features == "True":
+            prediction.save(f"{opt.out_path}/prediction_{attempt}.npz")
         success_count += 1

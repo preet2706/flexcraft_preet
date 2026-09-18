@@ -485,7 +485,8 @@ class Joltz2Evaluator(eqx.Module):
 
             t_hat = sigma_tm * (1 + gamma)
             noise_var = sm.noise_scale**2 * (t_hat**2 - sigma_tm**2)
-            eps = jnp.sqrt(noise_var) * jax.random.normal(shape = shape, key = key)
+            # important to clip the input to sqrt, otherwise stuff blows up on CPU
+            eps = jnp.sqrt(jnp.maximum(noise_var, 0.0)) * jax.random.normal(shape = shape, key = key)
             key = jax.random.fold_in(key, 1)
             atom_coords_noisy = atom_coords + eps
             atom_coords_denoised = sm.preconditioned_network_forward(

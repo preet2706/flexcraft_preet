@@ -3,7 +3,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from salad.modules.utils.geometry import positions_to_ncacocb
+from salad.modules.utils.geometry import positions_to_ncacocb, compute_pseudo_cb
 
 def atom_array_to_atomX(atom_array, atom_to_token, num_atoms=14):
     residue_atom_count = atom_to_token.sum(axis=0)
@@ -80,3 +80,16 @@ def get_contact_atom(atom24, mol_type):
     rna = jnp.where((mol_type == 2)[:, None], rna, 0.0)
     smolecule = jnp.where((mol_type == 3)[:, None], smolecule, 0.0)
     return protein + dna + rna + smolecule
+
+def backbone_to_template_geometry(coords: jax.Array) -> tuple[jax.Array, jax.Array]: # coords: (L, >3, 3), assumes first three atoms are N, CA, C
+    n, ca, c = coords[:, 0], coords[:, 1], coords[:, 2]
+    # boltz uses graham-schmidt (boltz.data.tokenize.boltz2.py compute_frame) e1: c-ca, e2: orth(n-ca), e3: e1 x e2, t: ca
+    v1 = c - ca
+    v2 = n - ca
+    e1 = v1 / (jnp.linalg.norm(v1, axis=-1, keepdims=True) + 1e-10)
+    u2 = v2 - e1 * (e1 * v2).sum(axis=-1, keepdims=True)
+    e2 = u2 / (jnp.linalg.norm(u2, axis=-1, keepdims=True) + 1e-10)
+    e3 = jnp.cross(e1, e2, axis=-1)
+    rot = jnp.stack([e1, e2, e3], axis=-1) # (L, 3, 3), columns e1, e2, e3
+    t = ca
+    return rot, t

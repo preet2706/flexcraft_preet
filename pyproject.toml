@@ -25,6 +25,8 @@ dependencies = [
 [project.optional-dependencies]
 joltz = [
     "joltz @ git+https://github.com/nboyd/joltz.git",
+    "protenix @ git+https://github.com/escalante-bio/protenij.git",
+    "boltz @ git+https://github.com/escalante-bio/boltz.git",
     "torch>=2.3.1",
     "equinox>=0.13.5",
 ]

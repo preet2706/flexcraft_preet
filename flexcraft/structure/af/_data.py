@@ -12,11 +12,12 @@ import chex
 from chex import Array
 import tree
 
-from colabdesign.af.alphafold.model.geometry import Vec3Array
-from colabdesign.af.alphafold.model.modules import pseudo_beta_fn
-from colabdesign.af.alphafold.model.all_atom_multimer import atom14_to_atom37, atom37_to_atom14
-from colabdesign.af.prep import prep_input_features
-import colabdesign.af.inputs as cd_inputs
+from flexcraft.structure._colab_af.alphafold.model.geometry import Vec3Array
+from flexcraft.structure._colab_af.alphafold.model.modules import pseudo_beta_fn
+from flexcraft.structure._colab_af.alphafold.model.all_atom_multimer import atom14_to_atom37, atom37_to_atom14
+from flexcraft.structure._colab_af.prep import prep_input_features
+import flexcraft.structure._colab_af.inputs as cd_inputs
+import flexcraft.sequence.aa_codes as aas
 
 import salad.aflib.common.protein as af_protein
 
@@ -53,6 +54,8 @@ class AFInput:
 
     @staticmethod
     def from_sequence(sequence: Any) -> "AFInput":
+        if isinstance(sequence, str):
+            sequence = jax.nn.one_hot(aas.encode(sequence, aas.AF2_CODE), 20)
         return AFInput(
             prev_init=False,
             pos_init=False,
@@ -410,6 +413,11 @@ class AFResult:
     def pae(self):
         """Per-residue pair predicted aligned error."""
         return self._mean_of_binned("predicted_aligned_error", has_edges=False)
+
+    @property
+    def pae_logits(self):
+        """Per-residue pair predicted aligned error logits."""
+        return self.result["predicted_aligned_error"]["logits"]
     
     @property
     def ipae(self):
@@ -481,10 +489,11 @@ class AFResult:
         result = result.max(axis=0)
         return result
 
-    def ipsae(self, pae_cutoff=0.5):
+    def ipsae(self, chain_index=None, pae_cutoff=0.5):
         mask = self.pae < pae_cutoff
-        chain = self.inputs["asym_id"]
-        other_chain = chain[:, None] != chain[None, :]
+        if chain_index is None:
+            chain_index = self.inputs["asym_id"]
+        other_chain = chain_index[:, None] != chain_index[None, :]
         mask *= other_chain
         L = mask.sum(axis=1)[:, None]
         ptm = mask * self.ptm_matrix(L)
@@ -494,6 +503,25 @@ class AFResult:
     def distance(self):
         """Distogram predicted distance of pairs of amino acid residues."""
         return self._mean_of_binned("distogram")
+
+    @property
+    def distogram(self):
+        return jax.nn.softmax(self.result["distogram"]["logits"], axis=-1)
+    
+    @property
+    def log_distogram(self):
+        return jax.nn.log_softmax(self.result["distogram"]["logits"], axis=-1)
+        
+    @property
+    def distogram_bin_edges(self):
+        bin_edges = self.result["distogram"]["bin_edges"]
+        bin_step = bin_edges[1] - bin_edges[0]
+        bin_edges = jnp.concatenate((bin_edges[:1] - bin_step, bin_edges, bin_edges[-1:] + bin_step), axis=0)
+        return bin_edges
+
+    @property
+    def distogram_bin_centers(self):
+        return (self.distogram_bin_edges[1:] + self.distogram_bin_edges[:-1]) / 2
 
     def to_data(self) -> DesignData:
         """Convert an AFResult to DesignData."""
@@ -572,6 +600,44 @@ class AFResult:
         return self.chain_contact_score(
             chain, chain, contact_distance=contact_distance,
             min_resi_distance=min_resi_distance, num_contacts=num_contacts)
+
+    def index_contact_score(self, target_index, source_index, contact_distance=14.0,
+                            min_resi_distance=10, num_contacts=25):
+        entropy = self.contact_entropy(contact_distance=contact_distance)
+        resi_dist = abs(self.residue_index[:, None] - self.residue_index[None, :])
+        other_chain = self.chain_index[:, None] != self.chain_index[None, :]
+        entropy = jnp.where((resi_dist >= min_resi_distance) + other_chain > 0, entropy, 1e6)
+        entropy = jnp.where(target_index[None, :], entropy, 1e6)
+        # NOTE: Ensure that only valid entries are averaged
+        sorted_entropy = entropy.sort(axis=1)[:, :num_contacts]
+        is_valid_entropy = sorted_entropy < 1e5
+        mean_entropy = (sorted_entropy * is_valid_entropy).sum(axis=-1) / jnp.maximum(1, is_valid_entropy.sum(axis=-1))
+        contact_score = (mean_entropy * source_index).sum()
+        contact_score /= jnp.maximum(1, source_index.sum())
+        return contact_score
+
+    def index_iptm(self, chain_index=None):
+        if chain_index is None:
+            chain_index = self.chain_index
+        ptm = self.ptm_matrix()
+        other_chain = chain_index[:, None] != chain_index[None, :]
+        return ((ptm * other_chain).sum(-1) / jnp.maximum(1, other_chain.sum(-1))).max()
+
+    def index_ptm_score(self, chain_index=None):
+        if chain_index is None:
+            chain_index = self.chain_index
+        pae_logits = self.pae_logits
+        num_aa = pae_logits.shape[0]
+        num_aa = max(num_aa, 19)
+
+        d0 = 1.24 * (num_aa - 15) ** (1.0 / 3) - 1.8
+        bin_centers = (jnp.arange(64) / 64 + 1 / 128) * 32
+
+        scale = 1.0 / (1 + bin_centers ** 2 / d0 ** 2)
+        score = jax.nn.logsumexp(a=pae_logits, b=scale, axis=-1)
+        other_chain = chain_index[:, None] != chain_index[None, :]
+        score = (score * other_chain).sum() / jnp.maximum(1, other_chain.sum())
+        return score
 
     def save_pdb(self, path):
         """Save an AFResult in PDB format at `path`."""

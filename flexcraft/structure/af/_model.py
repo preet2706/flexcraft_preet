@@ -12,15 +12,11 @@ import jax
 import jax.numpy as jnp
 
 import ml_collections
-import colabdesign.af.alphafold.model.modules as modules
-import colabdesign.af.alphafold.model.modules_multimer as modules_multimer
-# from colabdesign.af.alphafold.model import model
-from colabdesign.af.alphafold.model.geometry import Vec3Array
-from colabdesign.af.alphafold.model.all_atom_multimer import atom14_to_atom37, atom37_to_atom14
-from colabdesign.af.prep import prep_input_features
-import colabdesign.af.inputs as cd_inputs
-from colabdesign.af.alphafold.model.config import model_config
-from colabdesign.af.alphafold.model.data import get_model_haiku_params
+import flexcraft.structure._colab_af.alphafold.model.modules as modules
+import flexcraft.structure._colab_af.alphafold.model.modules_multimer as modules_multimer
+# from flexcraft.structure._colab_af.alphafold.model import model
+from flexcraft.structure._colab_af.alphafold.model.config import model_config
+from flexcraft.structure._colab_af.alphafold.model.data import get_model_haiku_params
 from salad.aflib.common.protein import to_pdb, from_prediction
 import flexcraft.sequence.aa_codes as aas
 from flexcraft.data.data import DesignData
@@ -180,7 +176,7 @@ if __name__ == "__main__":
     from flexcraft.utils import Keygen, parse_options, load_pdb, strip_aa, tie_homomer
     from flexcraft.sequence.sample import *
     from flexcraft.sequence.mpnn import make_pmpnn
-    # from colabdesign.af.alphafold.common.protein import from_prediction, to_pdb
+    # from flexcraft.structure._colab_af.alphafold.common.protein import from_prediction, to_pdb
     opt = parse_options(
         "predict structures with AlphaFold",
         param_path="params/",

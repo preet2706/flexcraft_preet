@@ -23,6 +23,15 @@ class JoltzResult(eqx.Module):
     @property
     def distogram_bin_edges(self):
         return jnp.linspace(2.0, 22.0, 65)
+    
+    @property
+    def distogram_bin_centers(self):
+        edges = self.distogram_bin_edges
+        return (edges[1:] + edges[:-1]) / 2
+
+    @property
+    def distogram_mean(self):
+        return (self.distogram * self.distogram_bin_centers).sum(axis=-1)
 
     @property
     def sample_distogram(self):
@@ -356,7 +365,38 @@ class JoltzResult(eqx.Module):
             batch_index=jnp.zeros_like(self.residue_index),
             plddt=self.plddt.mean(axis=0) if len(self.plddt.shape) == 2 else self.plddt,
         )).untie()
+        
+    def chain_contact_frequency(self, target_chain=0, binder_chain=1,
+                                  contact_distance=8.0) -> jax.Array:
+        """Per-residue frequency with which each target_chain residue contacts
+        binder_chain, aggregated across all sampled structures.
+        Output is a 1D array of length L (full sequence) with values between 0
+        and 1; entries outside target_chain are 0.
+        Contact frequency is computed as the fraction of sampled structures in
+        which the contact atom (pseudo-CB) of the target residue is within
+        contact_distance of the contact atom of any binder_chain residue.
+        """
+        atom24, _ = self.atom24_samples
+        if self.is_single_sample:
+            atom24 = atom24[None]                          # (S, L, 24, 3), S == 1
+        mol_type = self.data["features"]["mol_type"][0]
+        contact_atom = jax.vmap(get_contact_atom, (0, None), 0)(atom24, mol_type)  # (S, L, 3)
 
+        chain = self.chain_index
+        is_target = chain == target_chain                  # (L,)
+        is_binder = chain == binder_chain                  # (L,)
+        pair_mask = is_target[:, None] & is_binder[None, :]  # (L, L)
+
+        def per_sample(contact_atom):                      # (L, 3)
+            dist = jnp.linalg.norm(
+                contact_atom[:, None, :] - contact_atom[None, :, :], axis=-1)  # (L, L)
+            return ((dist < contact_distance) & pair_mask).any(axis=1)        # (L,)
+
+        contacts = jax.vmap(per_sample, in_axes=0, out_axes=0)(contact_atom)  # (S, L)
+        return contacts.mean(axis=0)                       # (L,)
+
+    def save(self, path: str):
+        np.savez_compressed(path, **{k: np.array(v) for k, v in self.data.items()})
 
 @dataclass
 class JoltzPrediction:
@@ -378,3 +418,6 @@ class JoltzPrediction:
     def save_cif(self, path, sample_index=0):
         self.writer.save_cif(path, self.data["samples"][sample_index][None],
                              plddt=self.data["confidence"].plddt[sample_index][None])
+
+    def save(self, path):
+        self.result.save(path)
