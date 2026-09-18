@@ -57,6 +57,13 @@ opt = parse_options(
     std_buffer=3.0,
     clear_jit_cache="False",
     seed=42,
+    # Resume an interrupted run at the same --out_path: append to the existing CSVs instead
+    # of truncating them, and skip any (target, attempt) already fully recorded in
+    # results.csv (both stages present). Requires identical options to the original run --
+    # ScoreCSV(append=True) checks the column schema and refuses to append on a mismatch, but
+    # a changed --length/--dock_blueprint/etc. can still change what a "resumed" attempt
+    # would compute even if the schema happens to match, so keep the invocation the same.
+    resume="False",
     # --- docked blueprint mode -----------------------------------------------------------
     dock_blueprint="False",       # generate the blueprint AGAINST the target at a hotspot
     salad_ve_path="params/salad/default_ve_scaled-200k.jax",
@@ -85,6 +92,7 @@ opt = parse_options(
 )
 
 binder_length = opt.length
+resume = opt.resume == "True"
 dock_blueprint = opt.dock_blueprint == "True"
 use_target_template = opt.target_use_template == "True"
 # In docked mode the blueprint comes from the target-conditioned ve model, so the free-monomer
@@ -617,12 +625,32 @@ loss_update = jit_loss_update(loss)
 
 # ---------------------------------------------------------------------------------------
 # output files -- created ONCE, before both loops.
-# ScoreCSV.__init__ opens "wt" and rewrites the header (files/csv.py:15), so constructing
-# one inside the target loop would discard every previous target's rows.
+# ScoreCSV.__init__ opens "wt" and rewrites the header (files/csv.py:15) unless append=True
+# and the file already exists, so constructing one inside the target loop would (still)
+# discard every previous target's rows -- append mode only changes the ONE construction here.
 # ---------------------------------------------------------------------------------------
 
 for subdir in ("blueprints", "attempts", "success"):
     os.makedirs(f"{opt.out_path}/{subdir}/", exist_ok=True)
+
+# --resume: an attempt is complete once both its stage_1 and stage_2 rows are in
+# results.csv. Read that BEFORE constructing the (possibly append=True) writers below, since
+# ScoreCSV(append=True) leaves an existing file untouched -- we need its old contents, not
+# what we're about to (not) write to it.
+completed_attempts = set()
+if resume:
+    results_path = f"{opt.out_path}/results.csv"
+    if os.path.isfile(results_path):
+        import csv as _csv
+        stages_seen = {}
+        with open(results_path, "rt", newline="") as f:
+            for row in _csv.DictReader(f):
+                stages_seen.setdefault((row["target"], int(row["attempt"])), set()).add(row["stage"])
+        completed_attempts = {k for k, stages in stages_seen.items()
+                              if {"stage_1", "stage_2"} <= stages}
+        print(f"[resume] {results_path}: {len(completed_attempts)} attempts already complete")
+    else:
+        print(f"[resume] no existing {results_path} -- starting fresh")
 
 common_keys = [
     "plddt",
@@ -659,13 +687,13 @@ if dock_blueprint:
 
 trajectory = ScoreCSV(
     f"{opt.out_path}/trajectory.csv",
-    keys=["target", "attempt", "step", "total"] + common_keys)
+    keys=["target", "attempt", "step", "total"] + common_keys, append=resume)
 results_keys = (
     ["target", "attempt", "stage", "target_length", "passed"]
     + common_keys + blueprint_keys + placement_keys
     + ["sequence"] + string_keys)
-results = ScoreCSV(f"{opt.out_path}/results.csv", keys=results_keys)
-success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys)
+results = ScoreCSV(f"{opt.out_path}/results.csv", keys=results_keys, append=resume)
+success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys, append=resume)
 
 # The shuffled-pair null: epitope agreement between the blueprint of attempt i and the
 # prediction of attempt j (i != j) for the same target. Without it a Jaccard of 0.3 is
@@ -679,8 +707,8 @@ if dock_blueprint:
         f"{opt.out_path}/placement_null.csv",
         keys=["target", "blueprint_attempt", "prediction_attempt", "stage",
               "center_distance", "epitope_jaccard", "epitope_recall_vs_blueprint",
-              "n_epitope_blueprint", "n_epitope_predicted"])
-skipped = ScoreCSV(f"{opt.out_path}/skipped.csv", keys=["target", "reason"])
+              "n_epitope_blueprint", "n_epitope_predicted"], append=resume)
+skipped = ScoreCSV(f"{opt.out_path}/skipped.csv", keys=["target", "reason"], append=resume)
 
 # ---------------------------------------------------------------------------------------
 # sweep
@@ -784,17 +812,35 @@ def _report_stage(name, attempt, stage, sequence, prediction, design,
     return _report_result(name, attempt, stage, key(), results,
                           sequence, result, aux=aux)
 
+def _attempt_seed(name: str, attempt: int) -> int:
+    """Deterministic seed for one (target, attempt), independent of run order.
+
+    Used to reseed both the JAX Keygen and the global numpy RNG at the top of every attempt
+    (see the attempt loop below) -- not just once per target. A single continuously-advancing
+    per-target stream would make attempt N's draws depend on every attempt 0..N-1 having
+    actually run first in this process: skip attempts 0..11 under --resume and attempt 12
+    would silently replay attempt 0's exact draws (same Keygen state, same numpy state),
+    duplicating an already-completed design under a new attempt index. Reseeding from
+    (opt.seed, name, attempt) alone makes every attempt reproducible in isolation, so skipping
+    already-completed ones changes nothing about what the remaining ones produce.
+    """
+    digest = hashlib.sha256(f"{opt.seed}:{name}:{attempt}".encode()).hexdigest()
+    return int(digest[:8], 16) % (2 ** 31)
+
 for name, target_sequence in targets:
+    if resume and all((name, a) in completed_attempts for a in range(opt.attempts_per_target)):
+        print(f"[resume] {name}: all {opt.attempts_per_target} attempts already complete, skipping")
+        continue
+
     if opt.clear_jit_cache == "True":
         jax.clear_caches()
 
-    # Reseed per target so a single target's attempts are reproducible in isolation
-    # (a shared global stream would make target k depend on how many keys 0..k-1 drew,
-    # so --only_targets would not reproduce the full sweep).
+    # One-time per-target seed, used only for the one-time setup below this point: the target
+    # structure prediction in _predict_target_pdb (Keygen), and sample_centers_spaced in the
+    # docked-blueprint setup a little further down (numpy). Per-attempt work is reseeded
+    # separately, inside the attempt loop -- see _attempt_seed above.
     target_seed = opt.seed + int(hashlib.sha256(name.encode()).hexdigest()[:8], 16) % 100000
     key = Keygen(target_seed)
-    # pos_center selection, sample_centers_spaced and si.random_dssp all draw from the global
-    # numpy RNG, so per-target reproducibility needs this too, not just the Keygen.
     np.random.seed(target_seed % (2 ** 32))
 
     joltz_spec = (JoltzSpec()
@@ -887,6 +933,15 @@ for name, target_sequence in targets:
         null_rows = []
 
     for attempt in range(opt.attempts_per_target):
+        if resume and (name, attempt) in completed_attempts:
+            continue
+
+        # Reseed per attempt, not just per target -- see _attempt_seed's docstring. Must
+        # happen before anything below draws a key or a numpy random number.
+        seed_i = _attempt_seed(name, attempt)
+        key = Keygen(seed_i)
+        np.random.seed(seed_i % (2 ** 32))
+
         context = dict(recovery=10.0, ipae=0.05)
 
         # ---- a fresh salad backbone per attempt --------------------------------------
@@ -1045,6 +1100,13 @@ for name, target_sequence in targets:
     # epitope Jaccard has no baseline. center_distance is recorded because
     # sample_centers_spaced is hotspot-biased by construction: different attempts often land
     # on the same patch, which inflates the null. Condition on it when analysing.
+    #
+    # Under --resume, null_rows only holds attempts actually re-run THIS session -- already-
+    # completed attempts from a prior session are skipped outright (see the attempt loop) and
+    # never rebuilt, so they can't be re-paired here. A resumed target's null undercounts the
+    # full N*(N-1) matrix across its whole history rather than being wrong; each session's
+    # rows are appended, not overwritten, and pairs are never duplicated across sessions since
+    # a skipped attempt is never on either side of a newly-written pair.
     if docked is not None and len(null_rows) > 1:
         for a in null_rows:
             for b in null_rows:
