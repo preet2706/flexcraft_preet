@@ -44,6 +44,15 @@ class AFInput:
     
     def items(self):
         return self.data.items()
+    
+    @property
+    def chain_index(self):
+        return self.data["asym_id"]
+
+    @property
+    def residue_index(self):
+        return self.data["residue_index"]
+
     @staticmethod
     def from_data(data: Any) -> "AFInput":
         """Convert a dictionary or DesignData object to AFInput."""
@@ -372,6 +381,14 @@ class AFResult:
         return (bin_centers * jax.nn.softmax(logits)).sum(axis=-1)
 
     @property
+    def admits_samples(self):
+        return False
+
+    @property
+    def is_single_sample(self):
+        return True
+
+    @property
     def residue_index(self):
         return self.inputs["residue_index"]
     
@@ -638,6 +655,13 @@ class AFResult:
         other_chain = chain_index[:, None] != chain_index[None, :]
         score = (score * other_chain).sum() / jnp.maximum(1, other_chain.sum())
         return score
+
+    def save(self, path):
+        """Save an AFResult as a compressed npz archive."""
+        np.savez_compressed(
+            path,
+            **{f"inputs_{k}": np.array(v) for k, v in self.inputs},
+            **{f"result_{k}": np.array(v) for k, v in self.result})
 
     def save_pdb(self, path):
         """Save an AFResult in PDB format at `path`."""

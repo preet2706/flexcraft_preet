@@ -18,34 +18,26 @@ class Protenix:
         jit_predict = eqx.filter_jit(ProtenixEvaluator(
             model=self.model,
             num_recycle=num_recycle,
-            num_sampling_steps=num_sampling_steps,
-            deterministic=deterministic)._predict)
+            sampling_steps=num_sampling_steps)._predict)
         def _predict(key, joltz_spec: ProtenixSpec):
-            input, writer = joltz_spec.to_input(pad=True, cache=self.cache)
-            # writer_features = {
-            #     k: torch.tensor(np.array(v))
-            #     for k, v in features.items() if k != "record"
-            # }
-            # writer_features["record"] = writer_spec["features_dict"]["record"]
-            # writer_spec["features_dict"] = writer_features
-            #features = jax.tree.map(jnp.array, features)
+            input, writer = joltz_spec.to_input()
             prediction = jit_predict(key, input.features, num_samples=num_samples)
             return ProtenixPrediction(
                 data=prediction.data,
                 writer=writer)
         return _predict
 
-    def evaluator(self, sampling_steps=25, sample_parallel=False,
+    def evaluator(self, num_sampling_steps=25, sample_parallel=False,
                  num_recycle=4, stop_recycle_gradient=True):
         evaluator = ProtenixEvaluator(
-            model=self.model, sampling_steps=sampling_steps,
+            model=self.model, sampling_steps=num_sampling_steps,
             sample_parallel=sample_parallel,
             num_recycle=num_recycle,
             stop_recycle_gradient=stop_recycle_gradient)
         evaluator = eqx.tree_at(
             lambda m: (m.model.gamma0, m.model.step_scale_eta, m.model.noise_scale_lambda, m.model.N_steps),
             evaluator, 
-            (0.0, 1.0, 1.0, sampling_steps))
+            (0.0, 1.0, 1.0, num_sampling_steps))
         # return evaluator
         evaluator_params, evaluator_static = eqx.partition(evaluator, eqx.is_array)
         def _evaluator(params):
@@ -90,7 +82,12 @@ class ProtenixEvaluator(eqx.Module):
         return self._predict(
             key, features, recycling_state=recycling_state,
             num_samples=num_samples)
-        
+
+    def __call__(self, key, protenix_input: ProtenixInput,
+                 recycling_state = None, num_samples = 1):
+        return self.predict(key, protenix_input,
+                            recycling_state = recycling_state,
+                            num_samples = num_samples)
 
     def embedding(self, key, features) -> InitialEmbedding:
         embedding = self.model.embed_inputs(input_feature_dict=features)

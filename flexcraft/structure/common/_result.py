@@ -28,6 +28,14 @@ class AF3LikeResult(eqx.Module):
         return jnp.linspace(2.0, 22.0, 65)
 
     @property
+    def distogram_bin_centers(self):
+        return (self.distogram_bin_edges[1:] + self.distogram_bin_edges[:-1]) / 2
+
+    @property
+    def distogram_mean(self):
+        return (self.distogram * self.distogram_bin_centers).mean(axis=-1)
+
+    @property
     def sample_distogram(self):
         if self.is_single_sample:
             cb, _ = self.atom24_samples[:, 4]
@@ -171,6 +179,7 @@ class AF3LikeResult(eqx.Module):
         return self.data["features"]["mol_type"][0]
 
     def _transform_sampled(self, sampled_property, num_atoms=24):
+        print(sampled_property.shape)
         if self.is_single_sample:
             sampled_property = sampled_property[0]
         else:
@@ -198,6 +207,10 @@ class AF3LikeResult(eqx.Module):
     @property
     def is_single_sample(self):
         return len(self.data["samples"].shape) == 3
+
+    @property
+    def admits_samples(self):
+        return True
 
     @property
     def plddt_logits(self):

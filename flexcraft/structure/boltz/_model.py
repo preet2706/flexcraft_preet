@@ -577,6 +577,9 @@ class Joltz2Evaluator(eqx.Module):
         features = joltz_input.features
         return self._predict(key, features, num_samples=num_samples)
 
+    def __call__(self, key, joltz_input: JoltzInput, num_samples=1):
+        return self.predict(key, joltz_input, num_samples=num_samples)
+
     def score(self, key, joltz_input: JoltzInput, positions: jax.Array = None,
               data: DesignData = None):
         k1, k2 = jax.random.split(key, 2)

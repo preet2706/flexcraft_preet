@@ -202,6 +202,10 @@ class JoltzResult(eqx.Module):
         return len(self.data["samples"].shape) == 3
 
     @property
+    def admits_samples(self):
+        return True
+
+    @property
     def plddt_logits(self):
         plddt_logits = self.data["confidence"].plddt_logits
         if self.is_single_sample:

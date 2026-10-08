@@ -1,0 +1,1 @@
+from flexcraft.structure.af3_like.model import *

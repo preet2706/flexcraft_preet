@@ -21,6 +21,13 @@ class ProtenixResult(AF3LikeResult):
         return self.data["features"]["asym_id"]
 
     @property
+    def restype(self):
+        # get one-hot residue type
+        res_type_one_hot = self.data["features"]["restype"]
+        res_type = jnp.argmax(res_type_one_hot, axis=-1)
+        return res_type
+
+    @property
     def mol_type(self):
         return jnp.argmax(jnp.stack((
             self.data["features"]["is_protein"],

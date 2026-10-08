@@ -28,7 +28,7 @@ class ProtenixSpec(InputSpec):
     def to_features(self) -> dict:
         return to_features(self.chains, self.templates, self.constraints)
 
-    def to_input(self) -> "ProtenixInput":
+    def to_input(self, **kwargs) -> "ProtenixInput":
         features, atom_array, token_array = self.to_features()
         return ProtenixInput(features=features), ProtenixWriter(atom_array, token_array)
 
@@ -510,6 +510,54 @@ class ProtenixInput(ModelInput):
 
     def set_dna(self, sequence, start=0):
         return self._set_sequence(sequence, start=start, seq_slice=slice(26, 30), seq_count=4)
+
+    def _set_res_type(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20):
+        result = self.copy()
+        result.features["restype"] = jnp.array(result.features["restype"]).astype(jnp.float32)
+        result.features["restype"] = result.features["restype"].at[start:start + sequence.shape[0]].set(0.0)
+        result.features["restype"] = result.features["restype"].at[start:start + sequence.shape[0], seq_slice].set(sequence[:, :seq_count])
+        return result
+
+    def _set_profile(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20):
+        result = self.copy()
+        num_msa = result.features["msa"].shape[1]
+        result.features["profile"] = jnp.array(result.features["profile"]).astype(jnp.float32)
+        result.features["profile"] = result.features["profile"].at[start:start + sequence.shape[0]].set(0.0)
+        result.features["profile"] = result.features["profile"].at[start:start + sequence.shape[0], seq_slice].set(sequence[:, :seq_count] / num_msa)
+        # set gap count
+        result.features["profile"] = result.features["profile"].at[start:start + sequence.shape[0], 31].set((num_msa - 1) / num_msa)
+        return result
+
+    def _set_msa(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20):
+        result = self.copy()
+        result.features["msa"] = jnp.array(result.features["msa"]).astype(jnp.float32)
+        # FIXME: this is not one-hot?
+        # reset MSA for all positions we're setting:
+        # setting all msa positions to zero
+        result.features["msa"] = result.features["msa"].at[:, start:start + sequence.shape[0]].set(0.0)
+        # setting all msa positions from the 2nd sequence onwards to "-"
+        result.features["msa"] = result.features["msa"].at[1:, start:start + sequence.shape[0], 1].set(1.0)
+        # finally, setting the first sequence to the input sequence
+        result.features["msa"] = result.features["msa"].at[0, start:start + sequence.shape[0], seq_slice].set(sequence[:, :seq_count])
+        return result
+
+    def _set_sequence(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20,
+                      reset_msa=True, reset_profile=True):
+        # TODO: can we do this properly?
+        result = self.copy()
+        length = sequence.shape[0]
+        previous_res_type = result.features["restype"][start:start+length]
+        sequence = jnp.zeros_like(previous_res_type).at[:, seq_slice].set(sequence)
+        result = result._set_res_type(sequence, start=start, seq_slice=seq_slice, seq_count=seq_count)
+        if reset_profile:
+            n_msa = result.features["msa"].shape[0]
+            profile_update = (sequence - previous_res_type) / n_msa
+            result.features["profile"] = result.features["profile"].at[start:start+length].add(profile_update)
+        # if reset_profile:
+        #     result = result._set_profile(sequence, start=start, seq_slice=seq_slice, seq_count=seq_count)
+        # if reset_msa:
+        #     result = result._set_msa(sequence, start=start, seq_slice=seq_slice, seq_count=seq_count)
+        return result
 
     def set_template(self, coords, start=None,
                      mask=None, restype=None, template_id=0):
