@@ -23,9 +23,12 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 GREY = "#8C8C8C"
-# House palette from the landscape/mosaic_scan figures -- clearly distinct hues for a
-# small categorical subset (as opposed to the sequential viridis used for the full sweep).
-BLUE, ORANGE, GREEN = "#4C72B0", "#DD8452", "#55A868"
+# House palette from the landscape/mosaic_scan figures (seaborn "deep"-like) -- clearly
+# distinct hues for a small categorical subset, as opposed to the sequential viridis used
+# for the full sweep. PALETTE extends it far enough for any subset figure; BLUE/ORANGE/GREEN
+# are kept as names since earlier subset figures already reference them directly.
+PALETTE = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860", "#DA8BC3"]
+BLUE, ORANGE, GREEN = PALETTE[0], PALETTE[1], PALETTE[2]
 
 plt.rcParams.update({
     "figure.facecolor": "white",
@@ -64,6 +67,12 @@ def load(run_path):
     return pd.read_csv(os.path.join(run_path, "results.csv"))
 
 
+def _weights_matching(all_weights, targets, atol=1e-3):
+    """Pick the sweep's actual unique weight values closest to `targets` (values round-trip
+    through CSV as e.g. np.float32(0.1) -> 0.1000000014901161, so exact equality would miss)."""
+    return [w for w in all_weights if any(np.isclose(w, t, atol=atol) for t in targets)]
+
+
 def _kde(ax, values, color, label, fill=True):
     """Silverman-bandwidth KDE, with a fallback for degenerate data (matches
     scripts/plot_mosaic_scan.py's _kde)."""
@@ -97,13 +106,6 @@ def _footnote(fig, text, y=0.012):
 # ---------------------------------------------------------------------------------------
 # metric distributions, one KDE per distogram_loss_weight
 # ---------------------------------------------------------------------------------------
-
-def _select_weights(results, targets, atol=1e-3):
-    """Pick the sweep's actual unique weight values closest to `targets` (values round-trip
-    through CSV as e.g. np.float32(0.1) -> 0.1000000014901161, so exact equality would miss)."""
-    all_weights = sorted(results["distogram_loss_weight"].unique())
-    return [w for w in all_weights if any(np.isclose(w, t, atol=atol) for t in targets)]
-
 
 def fig_metrics(results, out_path, run_name, weights=None, colors=None, suffix=""):
     """One KDE-grid figure across all metrics, one curve per `weights` value (defaults to
@@ -162,19 +164,44 @@ def main():
 
     paths = [fig_metrics(results, out_path, run_name)]
 
-    def _subset_figure(targets, palette, suffix):
-        weights = _select_weights(results, targets)
-        if len(weights) != len(targets):
-            print(f"skipping {suffix} figure: found weights {weights}, "
-                  f"expected {len(targets)} matching {targets}")
-            return
+    # Baseline (lowest weight, normally 0.0) vs the next 1 and next 2 weights up the
+    # sweep -- adapts to whatever weights this run actually used, rather than hardcoding
+    # literal values that only matched one particular sweep's spacing.
+    all_weights = sorted(results["distogram_loss_weight"].unique())
+
+    def _subset_figure(weights, palette, suffix):
         paths.append(fig_metrics(results, out_path, run_name,
                                  weights=weights,
                                  colors=dict(zip(weights, palette)),
                                  suffix=suffix))
 
-    _subset_figure([0.0, 0.1], [BLUE, ORANGE], "_w0_vs_w0.1")
-    _subset_figure([0.0, 0.1, 0.5], [BLUE, ORANGE, GREEN], "_w0_vs_w0.1_vs_w0.5")
+    if len(all_weights) >= 2:
+        pair = all_weights[:2]
+        _subset_figure(pair, [BLUE, ORANGE],
+                       f"_w{pair[0]:g}_vs_w{pair[1]:g}")
+    if len(all_weights) >= 3:
+        triple = all_weights[:3]
+        _subset_figure(triple, [BLUE, ORANGE, GREEN],
+                       f"_w{triple[0]:g}_vs_w{triple[1]:g}_vs_w{triple[2]:g}")
+
+    # Explicit fixed comparison (0.0 vs 0.1) regardless of how the sweep is spaced --
+    # distinct from the "pair" figure above, which is the two *smallest* weights and may
+    # not be 0.1 (e.g. sweep2's smallest non-zero weight is 0.05). No-op if either is absent.
+    explicit_pair = _weights_matching(all_weights, [0.0, 0.1])
+    if len(explicit_pair) == 2 and explicit_pair != all_weights[:2]:
+        _subset_figure(explicit_pair, [BLUE, ORANGE],
+                       f"_w{explicit_pair[0]:g}_vs_w{explicit_pair[1]:g}")
+
+    # Explicitly requested: every weight except 0.05 (still includes 0.1). No-op if this
+    # sweep never had a 0.05 weight in the first place.
+    no_005 = [w for w in all_weights if not np.isclose(w, 0.05, atol=1e-3)]
+    if 2 <= len(no_005) < len(all_weights):
+        if len(no_005) <= len(PALETTE):
+            _subset_figure(no_005, PALETTE[:len(no_005)],
+                           "_" + "_vs_".join(f"w{w:g}" for w in no_005))
+        else:
+            print(f"skipping w!=0.05 figure: {len(no_005)} weights but only "
+                  f"{len(PALETTE)} palette colors defined")
 
     for p in paths:
         print("wrote", p)

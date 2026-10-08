@@ -455,12 +455,59 @@ def _run_msa_search(sequences: Sequence[str], msa_dir: str, email: str = "") -> 
 
 class ProtenixInput(ModelInput):
     features: dict
+
+    # Protenix's own feature dict (built by to_features() above, per AlphaFold3 SI Table 5 /
+    # protenix/data/utils.py's feat_shape) uses different keys/shapes than Boltz's, which the
+    # inherited ModelInput._set_res_type/_set_profile/_set_msa (common/_data.py) assume:
+    #   - "restype" (not "res_type"), shape (num_token, 32), no leading batch dim.
+    #   - "profile", shape (num_token, 32), no leading batch dim -- same layout as restype, so
+    #     a continuous probability vector carries over directly.
+    #   - "msa", shape (num_msa, num_token) of INTEGER restype indices (not one-hot like
+    #     Boltz's (1, num_msa, num_token, 33)) -- it is a lookup index into an embedding table
+    #     (see SparseEmbedding in protenix.backend), so it cannot represent a soft distribution.
+    #     With no MSA search (the only mode this wrapper supports), num_msa == 1 (a dummy
+    #     single-sequence MSA of just the query), so we set that one row to argmax(sequence),
+    #     matching what a hard sequence would produce -- the actual soft signal into the trunk
+    #     comes through restype/profile, which the MSA module also sees via s_inputs.
+
+    def _set_res_type(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20):
+        result = self.copy()
+        result.features["restype"] = jnp.array(result.features["restype"]).astype(jnp.float32)
+        result.features["restype"] = result.features["restype"].at[start:start + sequence.shape[0]].set(0.0)
+        result.features["restype"] = result.features["restype"].at[start:start + sequence.shape[0], seq_slice].set(sequence[:, :seq_count])
+        return result
+
+    def _set_profile(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20):
+        result = self.copy()
+        result.features["profile"] = jnp.array(result.features["profile"]).astype(jnp.float32)
+        result.features["profile"] = result.features["profile"].at[start:start + sequence.shape[0]].set(0.0)
+        result.features["profile"] = result.features["profile"].at[start:start + sequence.shape[0], seq_slice].set(sequence[:, :seq_count])
+        return result
+
+    def _set_msa(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20):
+        result = self.copy()
+        result.features["msa"] = jnp.array(result.features["msa"]).astype(jnp.int32)
+        offset = seq_slice.start
+        member_index = offset + jnp.argmax(sequence[:, :seq_count], axis=-1)
+        result.features["msa"] = result.features["msa"].at[0, start:start + sequence.shape[0]].set(member_index)
+        return result
+
+    def _set_sequence(self, sequence, start=0, seq_slice=slice(0, 20), seq_count=20,
+                      reset_msa=True, reset_profile=True):
+        result = self.copy()
+        result = result._set_res_type(sequence, start=start, seq_slice=seq_slice, seq_count=seq_count)
+        if reset_profile:
+            result = result._set_profile(sequence, start=start, seq_slice=seq_slice, seq_count=seq_count)
+        if reset_msa:
+            result = result._set_msa(sequence, start=start, seq_slice=seq_slice, seq_count=seq_count)
+        return result
+
     def set_aa(self, sequence, start=0):
         return self._set_sequence(sequence, start=start, seq_slice=slice(0, 20), seq_count=20)
 
     def set_rna(self, sequence, start=0):
         return self._set_sequence(sequence, start=start, seq_slice=slice(21, 25), seq_count=4)
-    
+
     def set_dna(self, sequence, start=0):
         return self._set_sequence(sequence, start=start, seq_slice=slice(26, 30), seq_count=4)
 

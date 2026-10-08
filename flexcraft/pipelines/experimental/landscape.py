@@ -80,6 +80,8 @@ opt = parse_options(
     h_bias=0.0,
     e_bias=0.0,
     distogram_loss_weights="0.0",
+    loss_ablation="False",
+    ablation_weights="0.1,1.0",
     seed=42
 )
 def _float_list(s: str) -> list:
@@ -88,6 +90,8 @@ def _float_list(s: str) -> list:
 hallucinate = opt.hallucinate == "True"
 avg_init = opt.avg_init == "True"
 distogram_loss_weights = _float_list(opt.distogram_loss_weights)
+loss_ablation = opt.loss_ablation == "True"
+ablation_weights = _float_list(opt.ablation_weights)
 use_bias = (opt.l_bias > 0.0) or (opt.h_bias > 0.0) or (opt.e_bias > 0.0)
 init_batch_size = opt.init_batch_size if avg_init else 1
 assert init_batch_size >= 1, "--init_batch_size must be >= 1"
@@ -299,7 +303,11 @@ def sample_init_batch(batch_size):
     # loss() and project_to_simplex both absorb downstream.
     return designs, sequence, parent
 
-def metrics(sequence, key, result: JoltzResult):
+def metrics(sequence, key, result: JoltzResult, target_distogram=None):
+    """`target_distogram` must be passed in explicitly, NOT read from the module-level
+    `params`: inside the jitted loss_update a global is baked into the compiled program as
+    a constant at first trace, so a per-attempt value read that way stays frozen at attempt
+    0's blueprint for the whole run. Pass the traced `params` argument's entry instead."""
     data = result.to_data(return_samples=True)
     dssp = data.p_dssp
     pmpnn_input = data.update(aa=aas.translate(data["aa"], aas.AF2_CODE, aas.PMPNN_CODE))
@@ -326,8 +334,8 @@ def metrics(sequence, key, result: JoltzResult):
         L = dssp["L"], H = dssp["H"], E = dssp["E"],
         ptm = result.ptm,
     )
-    if "target_distogram" in params:
-        out["distogram_nll"] = distogram_nll(result, params["target_distogram"])
+    if target_distogram is not None:
+        out["distogram_nll"] = distogram_nll(result, target_distogram)
     return out
 
 def dssp_to_string(dssp_array) -> str:
@@ -413,19 +421,24 @@ def _batch_spread(designs, parent=None) -> dict:
     rmsds = [float(RMSD(atoms=["CA"])(d, reference)) for d in others]
     return dict(batch_rmsd_to_ref=np.float32(np.mean(rmsds)))
 
-def _report_trajectory(index: int, writer: ScoreCSV, start_step=0):
+def _report_trajectory(index: int, writer: ScoreCSV, start_step=0, extra: dict = None):
+    """`extra` carries static, non-jitted fields (e.g. `loss_config`) into each row: `aux`
+    comes straight from the jitted loss_update every step, so it can never hold a string --
+    extra is merged in afterward, entirely in plain Python."""
     def _report(step: int, loss: float, aux: dict):
         print(loss.shape)
         line_info = dict(attempt=index, step=start_step + step, total=float(loss.mean()))
         for key in writer.keys:
             if key in aux:
                 line_info[key] = float(aux[key].mean())
+        if extra:
+            line_info.update(extra)
         writer.write_line(line_info)
     return _report
 
 def _report_result(attempt: int, stage: str, key, writer: ScoreCSV, sequence, result: JoltzResult, aux=None):
     if aux is None:
-        aux = metrics(sequence, key, result)
+        aux = metrics(sequence, key, result, target_distogram=params.get("target_distogram"))
     line_info = dict(attempt=attempt, stage=stage, sequence=aas.decode(jnp.argmax(sequence, axis=-1), aas.AF2_CODE))
     for key in writer.keys:
         if key in aux:
@@ -437,8 +450,9 @@ def _report_result(attempt: int, stage: str, key, writer: ScoreCSV, sequence, re
     writer.write_line(line_info)
     return aux
 
-# fitness function for hallucination
-def loss(sequence, key=None, context=None, params=None):
+# shared prefix for every loss variant below: set the sequence, predict structure, and
+# compute every metric regardless of which terms the caller actually sums into `value`.
+def _predict_and_score(sequence, key, params):
     keys = jax.random.split(key, 4)
     # forbid cysteines
     sequence = sequence.at[:, aas.AF2_CODE.index("C")].set(0.0)
@@ -448,23 +462,42 @@ def loss(sequence, key=None, context=None, params=None):
     # predict structure
     result: JoltzResult = joltz(params["joltz"]).predict(keys[0], joltz_input, num_samples=4)
     # compute losses
-    out = metrics(sequence, keys[1], result)
+    # `params` here is the jitted function's traced argument, so target_distogram is a
+    # real input that updates per attempt (unlike the module-level global params).
+    out = metrics(sequence, keys[1], result, target_distogram=params.get("target_distogram"))
     out["result"] = result
+    return out
 
-    # combination
-    value = (
-          out["contacts"]
-        - 10.0 * out["recovery"]
-        + 0.4 * out["pae"]
-        - 0.1 * out["plddt"]
-    )
+# fold in the (weighted) distogram term shared by every loss variant, and finalize `out`.
+def _with_distogram(value, out, params):
     distogram_weight = params.get("distogram_loss_weight", 0.0)
     if "distogram_nll" in out:
         value = value + distogram_weight * out["distogram_nll"]
     out["distogram_loss_weight"] = distogram_weight
     out["total"] = value
     return value, out
-loss_update = jit_loss_update(loss)
+
+# fitness function for hallucination -- the normal landscape loss (all 4 terms + distogram)
+def loss_full(sequence, key=None, context=None, params=None):
+    out = _predict_and_score(sequence, key, params)
+    value = (
+          out["contacts"]
+        - 10.0 * out["recovery"]
+        + 0.4 * out["pae"]
+        - 0.1 * out["plddt"]
+    )
+    return _with_distogram(value, out, params)
+loss_update_full = jit_loss_update(loss_full)
+
+# ablation variant: only recovery + plddt (+ distogram) -- contacts and pae dropped entirely
+def loss_distogram_recovery_plddt(sequence, key=None, context=None, params=None):
+    out = _predict_and_score(sequence, key, params)
+    value = (
+        - 10.0 * out["recovery"]
+        - 0.1 * out["plddt"]
+    )
+    return _with_distogram(value, out, params)
+loss_update_distogram_recovery_plddt = jit_loss_update(loss_distogram_recovery_plddt)
 
 os.makedirs(f"{opt.out_path}/blueprints/", exist_ok=True)
 os.makedirs(f"{opt.out_path}/attempts/", exist_ok=True)
@@ -480,6 +513,7 @@ common_keys = [
     "pae",
     "distogram_nll",
     "distogram_loss_weight",
+    "loss_config",
     "average_num_nonzero",
     "L", "H", "E",
     "ptm",
@@ -500,14 +534,20 @@ results_keys = [
 results = ScoreCSV(f"{opt.out_path}/results.csv", keys=results_keys)
 success = ScoreCSV(f"{opt.out_path}/success.csv", keys=results_keys)
 
-def _hallucinate_once(attempt, sequence, params, context, designs, init_diagnostics, weight=None):
+def _hallucinate_once(attempt, sequence, params, context, designs, init_diagnostics,
+                      weight=None, loss_update=loss_update_full, config_label=None):
     """Run one hallucination optimization (loss_update init call + simplex_agpm + final
-    prediction/report) starting from `sequence`. `weight` is only used to tag output
-    filenames/CSV rows -- reassigning `sequence` here does not affect the caller's copy,
-    so calling this repeatedly with the same outer `sequence` (e.g. once per
-    distogram_loss_weight, against the same blueprint) restarts optimization from the same
-    starting distribution each time."""
-    suffix = f"_w{weight}" if weight is not None else ""
+    prediction/report) starting from `sequence`. `weight`/`config_label` are only used to
+    tag output filenames/CSV rows -- reassigning `sequence` here does not affect the
+    caller's copy, so calling this repeatedly with the same outer `sequence` (e.g. once per
+    distogram_loss_weight and/or loss configuration, against the same blueprint) restarts
+    optimization from the same starting distribution each time. `loss_update` selects which
+    loss formula to optimize (see loss_update_full / loss_update_distogram_recovery_plddt) --
+    it must be a distinct jitted function, never a value threaded through `params`, since a
+    formula choice can't be a jit-traced leaf."""
+    suffix = f"_{config_label}" if config_label is not None else ""
+    if weight is not None:
+        suffix += f"_w{weight:g}"
     (_, aux), _ = loss_update(sequence, key=key(), params=params)
     aux_data: DesignData = aux["result"].to_data()
     aux_data.save_pdb(f"{opt.out_path}/attempts/design_{attempt}{suffix}_init.pdb")
@@ -520,18 +560,22 @@ def _hallucinate_once(attempt, sequence, params, context, designs, init_diagnost
         param_transform=lambda x: x.at[:, aas.AF2_CODE.index("C")].set(0.0),
         verbose=True, return_last=False,
         early_stop=None,
-        report=_report_trajectory(attempt, trajectory, start_step=0))
+        report=_report_trajectory(attempt, trajectory, start_step=0,
+                                  extra=dict(loss_config=config_label) if config_label is not None else None))
     result = aux["result"]
     data = result.to_data()
     hardened_sequence = data.to_sequence_string()
     prediction_1 = joltz_pred(key(), JoltzSpec().add_protein(hardened_sequence))
     final_result: JoltzResult = prediction_1.result
     predicted_data = final_result.to_data()
-    report_aux = metrics(sequence, key(), final_result)
+    report_aux = metrics(sequence, key(), final_result,
+                         target_distogram=params.get("target_distogram"))
     report_aux.update(_structure_comparison_batch(designs, predicted_data))
     report_aux["init"] = "soft"
     if weight is not None:
         report_aux["distogram_loss_weight"] = np.float32(weight)
+    if config_label is not None:
+        report_aux["loss_config"] = config_label
     report_aux.update(_init_provenance())
     report_aux.update(init_diagnostics)
     _report_result(attempt, "stage_1", key(), results, sequence, final_result, aux=report_aux)
@@ -585,6 +629,20 @@ while success_count < opt.num_designs:
     if hallucinate:
         if avg_init:
             _hallucinate_once(attempt, sequence, params, context, designs, init_diagnostics)
+        elif loss_ablation:
+            # Ablation: which loss TERMS matter, not just the distogram weight. 1 baseline
+            # (no distogram) + `ablation_weights` runs of the full loss + distogram +
+            # `ablation_weights` runs of a reduced loss (distogram + recovery + plddt only).
+            # All against the SAME blueprint/target_distogram, restarting from the same
+            # initial `sequence` each time.
+            run_specs = [("no_distogram", loss_update_full, 0.0)]
+            run_specs += [("full_with_distogram", loss_update_full, w) for w in ablation_weights]
+            run_specs += [("distogram_recovery_plddt", loss_update_distogram_recovery_plddt, w)
+                          for w in ablation_weights]
+            for config_label, lu, w in run_specs:
+                params["distogram_loss_weight"] = w
+                _hallucinate_once(attempt, sequence, params, context, designs, init_diagnostics,
+                                  weight=w, loss_update=lu, config_label=config_label)
         else:
             # Sweep distogram_loss_weight against the SAME blueprint/target_distogram
             # (set once per attempt above), restarting from the same initial `sequence`
@@ -598,7 +656,8 @@ while success_count < opt.num_designs:
             joltz_input: JoltzInput = params["joltz_input"].set_aa(seq_variant)
             final_result: JoltzResult = joltz(params["joltz"]).predict(key(), joltz_input, num_samples=4)
             predicted_data = final_result.to_data()
-            report_aux = metrics(seq_variant, key(), final_result)
+            report_aux = metrics(seq_variant, key(), final_result,
+                                 target_distogram=params.get("target_distogram"))
             report_aux.update(_structure_comparison_batch(designs, predicted_data))
             report_aux["init"] = init_label
             report_aux.update(_init_provenance())

@@ -53,6 +53,15 @@ class ProtenixResult(AF3LikeResult):
             return jnp.fill_diagonal(pae, 0.0, inplace=False) / 32
         return jax.vmap(lambda x: jnp.fill_diagonal(x, 0.0, inplace=False))(pae) / 32
 
+    @property
+    def restype(self):
+        # Protenix's "restype" feature (unlike Boltz's "res_type") has no leading batch
+        # dimension and no -2 offset: indices 0-19 are directly the 20 standard AAs, in the
+        # same order as flexcraft's aas.AF2_CODE. AF3LikeResult.restype (the inherited
+        # default) assumes Boltz's layout and would read the wrong array/shape here.
+        res_type_one_hot = self.data["features"]["restype"]
+        return jnp.argmax(res_type_one_hot, axis=-1)
+
 @dataclass
 class ProtenixPrediction:
     data: Any

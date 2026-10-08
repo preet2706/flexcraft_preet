@@ -9,6 +9,11 @@ mapped. This script maps it: for every (mode, secondary-structure bias, temperat
 ProteinMPNN distributions, sharpens, runs ONE Boltz2 forward pass (no hallucination), and
 records the averaged distribution + predicted structure + metrics.
 
+--structure_model selects the structure predictor for the one forward pass per grid point:
+boltz2 (default), protenix_v1 (protenix_base_default_v1.0.0) or protenix_v2 (protenix-v2).
+Everything else -- grid, seeds, blueprint batches, averaging, metrics -- is identical, so
+runs with different backends (each with its own --out_path) are directly comparable.
+
 The grid (see parse_options below for the CLI flags that override these):
     init_temperature   0.1 .. 1.0 step 0.1                              (10 values)
     secondary bias      L=0.2 fixed, E 0.0 .. 0.8 step 0.1, H = 0.8-E    (9 values)
@@ -88,7 +93,6 @@ import flexcraft.sequence.aa_codes as aas
 from flexcraft.sequence.mpnn import make_pmpnn
 from flexcraft.utils import parse_options, data_from_salad
 from flexcraft.files import ScoreCSV
-from flexcraft.structure.boltz import Joltz2, JoltzResult, JoltzSpec
 from flexcraft.data.data import DesignData
 from flexcraft.pipelines.utils import bias_dssp
 from flexcraft.structure.metrics import RMSD
@@ -120,7 +124,8 @@ opt = parse_options(
     "(no hallucination -- one Boltz forward pass per grid point).",
     num_aa="100",
     out_path="runs/titration/",
-    boltz_path="./params/boltz/",
+    structure_model="boltz2",         # boltz2 | protenix_v1 | protenix_v2
+    boltz_path="./params/boltz/",     # boltz2 only; protenix weights auto-download to ~/.protenix/
     salad_params="params/salad/default_vp_scaled-200k.jax",
     pmpnn_params="params/pmpnn/v_48_030.pkl",
     # --- the grid -----------------------------------------------------------
@@ -137,8 +142,9 @@ opt = parse_options(
     std_buffer=3.0,
     num_steps=500,
     out_steps=400,
-    boltz_samples=4,
-    boltz_recycles=4,
+    boltz_samples=4,                  # diffusion samples per forward pass (either backend)
+    boltz_recycles=4,                 # trunk recycles (either backend)
+    sampling_steps=25,                # diffusion sampling steps (either backend)
     share_dssp_across_modes="True",   # same hard string for same_dssp & partial at equal E
     # --- execution ------------------------------------------------------------
     save_blueprints="True",
@@ -146,6 +152,11 @@ opt = parse_options(
     resume="False",
     seed=42,
 )
+
+PROTENIX_MODELS = {"protenix_v1": "protenix_base_default_v1.0.0", "protenix_v2": "protenix-v2"}
+STRUCTURE_MODELS = ["boltz2"] + list(PROTENIX_MODELS)
+assert opt.structure_model in STRUCTURE_MODELS, \
+    f"unknown --structure_model {opt.structure_model!r}; expected one of {STRUCTURE_MODELS}"
 
 MODE_ORDER = ["bias", "same_dssp", "partial"]
 MODES = [m.strip() for m in opt.modes.split(",") if m.strip()]
@@ -306,10 +317,25 @@ sampler = si.Sampler(salad_step, num_steps=opt.num_steps, out_steps=opt.out_step
 _pmpnn, pmpnn_params = make_pmpnn(opt.pmpnn_params, eps=0.05, split_params=True)
 params = dict(mpnn=pmpnn_params)
 
-joltz_model = Joltz2(cache=opt.boltz_path)
-joltz, params["joltz"] = joltz_model.evaluator(num_recycle=opt.boltz_recycles)
-joltz_spec = JoltzSpec().add_protein("X" * num_aa)
-params["joltz_input"], _writer = joltz_spec.to_input(pad=False)
+# Structure predictor backend. Both branches leave `predictor` (params -> evaluator with
+# .predict(key, input, num_samples=)) and params["predictor"] / params["predictor_input"]
+# (input with .set_aa(soft (L,20) distribution)) with the same call shapes, so nothing
+# below depends on which one was selected. The evaluator's result must expose to_data(),
+# plddt, pae, ptm, contact_score() and is_single_sample.
+if opt.structure_model == "boltz2":
+    from flexcraft.structure.boltz import Joltz2, JoltzSpec
+    _structure_model = Joltz2(cache=opt.boltz_path)
+    predictor, params["predictor"] = _structure_model.evaluator(
+        num_recycle=opt.boltz_recycles, num_sampling_steps=opt.sampling_steps)
+    params["predictor_input"], _writer = JoltzSpec().add_protein("X" * num_aa).to_input(pad=False)
+else:
+    from flexcraft.structure.protenix._model import Protenix
+    from flexcraft.structure.protenix._data import ProtenixSpec
+    _structure_model = Protenix(model=PROTENIX_MODELS[opt.structure_model])
+    predictor, params["predictor"] = _structure_model.evaluator(
+        num_recycle=opt.boltz_recycles, sampling_steps=opt.sampling_steps)
+    params["predictor_input"], _writer = ProtenixSpec().add_protein("X" * num_aa).to_input()
+print(f"Structure predictor: {opt.structure_model}")
 
 
 def batch_mpnn(mpnn):
@@ -392,6 +418,7 @@ os.makedirs(f"{opt.out_path}/predictions", exist_ok=True)
 with open(f"{opt.out_path}/grid.json", "w") as f:
     json.dump(dict(
         N=N, num_aa=num_aa, init_batch_size=opt.init_batch_size, num_replicates=NR,
+        structure_model=opt.structure_model,
         modes=active_modes, e_grid=E_GRID, t_grid=T_GRID, s_grid=S_GRID,
         l_bias=opt.l_bias, seed=opt.seed, offsets=offsets, grid=GRID,
     ), f, indent=2)
@@ -399,7 +426,7 @@ with open(f"{opt.out_path}/grid.json", "w") as f:
 
 # ============================== reporting (mirrors landscape.py) ==============================
 
-def metrics(sequence, key, result: JoltzResult):
+def metrics(sequence, key, result):
     data = result.to_data(return_samples=True)
     dssp = data.p_dssp
     pmpnn_input = data.update(aa=aas.translate(data["aa"], aas.AF2_CODE, aas.PMPNN_CODE))
@@ -634,8 +661,8 @@ def run_batch(mode, e_index, e, l, h, r_index, s_index, start_steps, dssp_cond, 
         try:
             sequence = average_and_sharpen(raw_logits, T)
             ks = jax.random.split(_grid_key(di), 2)
-            joltz_input = params["joltz_input"].set_aa(sequence)
-            result = joltz(params["joltz"]).predict(ks[0], joltz_input, num_samples=opt.boltz_samples)
+            predictor_input = params["predictor_input"].set_aa(sequence)
+            result = predictor(params["predictor"]).predict(ks[0], predictor_input, num_samples=opt.boltz_samples)
             predicted = result.to_data()
 
             aux = metrics(sequence, ks[1], result)

@@ -18,7 +18,7 @@ OUT_PATH="$REPO_DIR/test_run_hallucinate"
 # ------------------------
 
 module purge
-CONDA_ENV="flexcraft"
+CONDA_ENV="flexcraft_new"
 source ~/.bashrc
 conda activate "$CONDA_ENV"
 
