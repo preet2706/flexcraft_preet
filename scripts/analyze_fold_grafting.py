@@ -304,6 +304,8 @@ def fig_fold_recovery(df, null_rmsd, null_dssp, order_labels, order_cats, out_pa
             ax.axvline(float(apo[col].iloc[0]), color="#C44E52", lw=1.5, label="apo (no target)")
         ax.set_xlabel(xlabel)
         ax.set_ylabel("density" if k == 0 else "")
+        if col.startswith("dssp"):
+            ax.set_xlim(0, 1.0)             # an identity fraction cannot exceed 1
         ax.set_title(f"Density, all attempts ({note})", fontsize=10)
         if k == 0:
             ax.legend(frameon=False, fontsize=7)
@@ -508,7 +510,8 @@ def main():
     for _, r in summary.iterrows():
         print(f"  {r.condition_name:34s} {int(r.n_grafted_strict)}/{int(r.n_grafted_lenient)} of "
               f"{int(r.n_attempts)}   retained {int(r.n_retained_strict)}/{int(r.n_retained_lenient)}   "
-              f"mean RMSD {r.rmsd_to_blueprint_mean:.2f} A")
+              f"RMSD {r.rmsd_to_blueprint_mean:.2f} +/- {r.rmsd_to_blueprint_std:.2f} A   "
+              f"DSSP identity {r.dssp_identity_mean:.2f}")
 
     fig_overview(df, null, order_labels, order_cats, n_att, out_path, strict, lenient)
     fig_fold_dependence(df, out_path)

@@ -10,7 +10,9 @@ ProteinMPNN distributions, sharpens, runs ONE Boltz2 forward pass (no hallucinat
 records the averaged distribution + predicted structure + metrics.
 
 --structure_model selects the structure predictor for the one forward pass per grid point:
-boltz2 (default), protenix_v1 (protenix_base_default_v1.0.0) or protenix_v2 (protenix-v2).
+boltz2 (default), protenix_v1 (protenix_base_default_v1.0.0), protenix_v2 (protenix-v2) or
+af2 (af2_model_1_ptm); any other AF3Like model name (e.g. af2_model_3_ptm) is passed through.
+AF2 returns a single sample, so --boltz_samples and --sampling_steps have no effect on it.
 Everything else -- grid, seeds, blueprint batches, averaging, metrics -- is identical, so
 runs with different backends (each with its own --out_path) are directly comparable.
 
@@ -96,6 +98,9 @@ from flexcraft.files import ScoreCSV
 from flexcraft.data.data import DesignData
 from flexcraft.pipelines.utils import bias_dssp
 from flexcraft.structure.metrics import RMSD
+from flexcraft.structure.af3_like import (
+    AF3Like, AF3LikeSpec, resolve_model, model_kind, supports_samples,
+    to_input_kwargs, model_init_kwargs)
 
 
 def _float_list(s):
@@ -124,8 +129,10 @@ opt = parse_options(
     "(no hallucination -- one Boltz forward pass per grid point).",
     num_aa="100",
     out_path="runs/titration/",
-    structure_model="boltz2",         # boltz2 | protenix_v1 | protenix_v2
+    structure_model="boltz2",         # boltz2 | protenix_v1 | protenix_v2 | af2 | any AF3Like name
+                                      # (e.g. protenix-v2, af2_model_3_ptm); af2 = af2_model_1_ptm
     boltz_path="./params/boltz/",     # boltz2 only; protenix weights auto-download to ~/.protenix/
+    af_path="params/af/",             # af2 only
     salad_params="params/salad/default_vp_scaled-200k.jax",
     pmpnn_params="params/pmpnn/v_48_030.pkl",
     # --- the grid -----------------------------------------------------------
@@ -142,9 +149,9 @@ opt = parse_options(
     std_buffer=3.0,
     num_steps=500,
     out_steps=400,
-    boltz_samples=4,                  # diffusion samples per forward pass (either backend)
-    boltz_recycles=4,                 # trunk recycles (either backend)
-    sampling_steps=25,                # diffusion sampling steps (either backend)
+    boltz_samples=4,                  # diffusion samples per forward pass (boltz/protenix; af2 makes 1)
+    boltz_recycles=4,                 # trunk recycles (any backend)
+    sampling_steps=25,                # diffusion sampling steps (boltz/protenix; ignored by af2)
     share_dssp_across_modes="True",   # same hard string for same_dssp & partial at equal E
     # --- execution ------------------------------------------------------------
     save_blueprints="True",
@@ -153,10 +160,11 @@ opt = parse_options(
     seed=42,
 )
 
-PROTENIX_MODELS = {"protenix_v1": "protenix_base_default_v1.0.0", "protenix_v2": "protenix-v2"}
-STRUCTURE_MODELS = ["boltz2"] + list(PROTENIX_MODELS)
-assert opt.structure_model in STRUCTURE_MODELS, \
-    f"unknown --structure_model {opt.structure_model!r}; expected one of {STRUCTURE_MODELS}"
+# model_kind raises on unknown names; resolve_model maps the aliases (boltz2, protenix_v1, ...)
+# to AF3Like model names.
+STRUCTURE_MODEL = resolve_model(opt.structure_model)
+MODEL_KIND = model_kind(opt.structure_model)
+NUM_STRUCTURE_SAMPLES = opt.boltz_samples if supports_samples(STRUCTURE_MODEL) else 1
 
 MODE_ORDER = ["bias", "same_dssp", "partial"]
 MODES = [m.strip() for m in opt.modes.split(",") if m.strip()]
@@ -317,25 +325,20 @@ sampler = si.Sampler(salad_step, num_steps=opt.num_steps, out_steps=opt.out_step
 _pmpnn, pmpnn_params = make_pmpnn(opt.pmpnn_params, eps=0.05, split_params=True)
 params = dict(mpnn=pmpnn_params)
 
-# Structure predictor backend. Both branches leave `predictor` (params -> evaluator with
-# .predict(key, input, num_samples=)) and params["predictor"] / params["predictor_input"]
-# (input with .set_aa(soft (L,20) distribution)) with the same call shapes, so nothing
-# below depends on which one was selected. The evaluator's result must expose to_data(),
-# plddt, pae, ptm, contact_score() and is_single_sample.
-if opt.structure_model == "boltz2":
-    from flexcraft.structure.boltz import Joltz2, JoltzSpec
-    _structure_model = Joltz2(cache=opt.boltz_path)
-    predictor, params["predictor"] = _structure_model.evaluator(
-        num_recycle=opt.boltz_recycles, num_sampling_steps=opt.sampling_steps)
-    params["predictor_input"], _writer = JoltzSpec().add_protein("X" * num_aa).to_input(pad=False)
-else:
-    from flexcraft.structure.protenix._model import Protenix
-    from flexcraft.structure.protenix._data import ProtenixSpec
-    _structure_model = Protenix(model=PROTENIX_MODELS[opt.structure_model])
-    predictor, params["predictor"] = _structure_model.evaluator(
-        num_recycle=opt.boltz_recycles, sampling_steps=opt.sampling_steps)
-    params["predictor_input"], _writer = ProtenixSpec().add_protein("X" * num_aa).to_input()
-print(f"Structure predictor: {opt.structure_model}")
+# Structure predictor backend. Whichever model was selected, `predictor` (params -> evaluator
+# with .predict(key, input, num_samples=)) and params["predictor"] / params["predictor_input"]
+# (input with .set_aa(soft (L,20) distribution)) have the same call shapes, so nothing below
+# depends on it. The evaluator's result must expose to_data(), plddt, pae, ptm,
+# contact_score() and is_single_sample. AF2 returns a single sample and ignores
+# num_sampling_steps.
+_structure_model = AF3Like(
+    STRUCTURE_MODEL,
+    **model_init_kwargs(STRUCTURE_MODEL, boltz_cache=opt.boltz_path, af_cache=opt.af_path))
+predictor, params["predictor"] = _structure_model.evaluator(
+    num_recycle=opt.boltz_recycles, num_sampling_steps=opt.sampling_steps)
+params["predictor_input"], _writer = AF3LikeSpec().add_protein("X" * num_aa).to_input(
+    model=STRUCTURE_MODEL, **to_input_kwargs(STRUCTURE_MODEL, pad=False))
+print(f"Structure predictor: {opt.structure_model} -> {STRUCTURE_MODEL}")
 
 
 def batch_mpnn(mpnn):
@@ -418,7 +421,7 @@ os.makedirs(f"{opt.out_path}/predictions", exist_ok=True)
 with open(f"{opt.out_path}/grid.json", "w") as f:
     json.dump(dict(
         N=N, num_aa=num_aa, init_batch_size=opt.init_batch_size, num_replicates=NR,
-        structure_model=opt.structure_model,
+        structure_model=opt.structure_model, structure_model_resolved=STRUCTURE_MODEL,
         modes=active_modes, e_grid=E_GRID, t_grid=T_GRID, s_grid=S_GRID,
         l_bias=opt.l_bias, seed=opt.seed, offsets=offsets, grid=GRID,
     ), f, indent=2)
@@ -662,7 +665,7 @@ def run_batch(mode, e_index, e, l, h, r_index, s_index, start_steps, dssp_cond, 
             sequence = average_and_sharpen(raw_logits, T)
             ks = jax.random.split(_grid_key(di), 2)
             predictor_input = params["predictor_input"].set_aa(sequence)
-            result = predictor(params["predictor"]).predict(ks[0], predictor_input, num_samples=opt.boltz_samples)
+            result = predictor(params["predictor"]).predict(ks[0], predictor_input, num_samples=NUM_STRUCTURE_SAMPLES)
             predicted = result.to_data()
 
             aux = metrics(sequence, ks[1], result)

@@ -10,6 +10,9 @@
 #   joltz        Boltz-2 (default; behaviour unchanged)
 #   protenix_v1  Protenix base v1.0.0   (checkpoint "protenix_base_default_v1.0.0")
 #   protenix_v2  Protenix v2            (checkpoint "protenix-v2")
+#   af2          AlphaFold2 (af2_model_1_ptm); any other AF3Like name is passed through, e.g.
+#                af2_model_3_ptm or protenix-v2. AF2 ignores MSAs and returns one sample, so the
+#                target must enter the complex as a template (--target_use_template True).
 # Everything downstream of the predictor (loss, metrics, CSV/PDB layout, --resume) is shared;
 # the two backends differ only in how inputs are built (see _complex_spec / _to_input below).
 #
@@ -45,8 +48,9 @@ from flexcraft.sequence.mpnn import make_pmpnn
 import flexcraft.sequence.aa_codes as aas
 from flexcraft.hallucination.opt import jit_loss_update, simplex_agpm
 from flexcraft.hallucination.losses.distogram import blueprint_distogram, distogram_nll
-from flexcraft.structure.boltz._model import Joltz2
-from flexcraft.structure.boltz._data import JoltzSpec
+from flexcraft.structure.af3_like import (
+    AF3Like, AF3LikeSpec, resolve_model, model_kind, uses_msa, supports_samples,
+    template_chains_are_complex_chains, to_input_kwargs, model_init_kwargs)
 from flexcraft.structure.common._result import AF3LikeResult
 from flexcraft.structure.metrics import RMSD
 from flexcraft.files import FastaFile, ScoreCSV
@@ -59,13 +63,19 @@ opt = parse_options(
     attempts_per_target=10,
     length=80,
     # parameters
-    # Which structure predictor to hallucinate against: joltz | protenix_v1 | protenix_v2.
-    # Use a distinct --out_path per model: results.csv gains a `structure_model` column for the
-    # Protenix models, and --resume refuses to continue a run made with a different model.
+    # Which structure predictor to hallucinate against: joltz | protenix_v1 | protenix_v2 | af2,
+    # or any AF3Like model name (af2_model_3_ptm, protenix-v2, ...); boltz2 is an alias of joltz.
+    # Use a distinct --out_path per model: results.csv gains a `structure_model` column for every
+    # model but Boltz, and --resume refuses to continue a run made with a different model.
     structure_model="joltz",
+    # Model that predicts the standalone TARGET structure (for --target_use_template and
+    # --dock_blueprint). "auto" = the structure model itself, except AF2, which folds a
+    # single-sequence target poorly and so uses Boltz-2 (joltz).
+    target_model="auto",
     pmpnn_path="params/solmpnn/v_48_030.pkl",
     salad_path="params/salad/default_vp_scaled-200k.jax",
     boltz_path="params/boltz/",
+    af_path="params/af/",
     # outputs
     out_path="out",
     msa_dir="none",
@@ -99,7 +109,7 @@ opt = parse_options(
     # is placed away from those residues. Needs --dock_blueprint True.
     coldspot_file="none",
     target_pdb_dir="none",        # default {out_path}/target_structures
-    # Use the target's cached structure (single-sequence prediction) as a TEMPLATE (Boltz or Protenix) for
+    # Use the target's cached structure (single-sequence prediction) as a TEMPLATE (Boltz, Protenix or AF2) for
     # every complex prediction, instead of an MSA. Independent of --dock_blueprint: predicting
     # and caching the target structure happens whenever either flag is set.
     target_use_template="False",
@@ -138,28 +148,27 @@ opt = parse_options(
     e_bias=0.0,
 )
 
-# Checkpoint names are the ones protenix.backend.KNOWN_MODELS resolves (downloaded on first
-# use from the nickrb/protenij HuggingFace repo into ~/.protenix).
-PROTENIX_CHECKPOINTS = {
-    "protenix_v1": "protenix_base_default_v1.0.0",
-    "protenix_v2": "protenix-v2",
-}
-assert opt.structure_model == "joltz" or opt.structure_model in PROTENIX_CHECKPOINTS, (
-    f"--structure_model must be one of {['joltz', *PROTENIX_CHECKPOINTS]}, "
-    f"got '{opt.structure_model}'")
-use_protenix = opt.structure_model in PROTENIX_CHECKPOINTS
-if use_protenix:
-    # Imported only when selected, so a Joltz run never depends on the protenix package.
-    import equinox as eqx
+# Protenix checkpoint names are the ones protenix.backend.KNOWN_MODELS resolves (downloaded on
+# first use from the nickrb/protenij HuggingFace repo into ~/.protenix). model_kind raises on an
+# unknown --structure_model / --target_model.
+STRUCTURE_MODEL = resolve_model(opt.structure_model)
+MODEL_KIND = model_kind(opt.structure_model)
+TARGET_TAG = ("joltz" if MODEL_KIND == "af2" else opt.structure_model) \
+    if opt.target_model == "auto" else opt.target_model
+TARGET_MODEL = resolve_model(TARGET_TAG)
+TARGET_KIND = model_kind(TARGET_TAG)
+NUM_STRUCTURE_SAMPLES = 4 if supports_samples(STRUCTURE_MODEL) else 1
+if "protenix" in (MODEL_KIND, TARGET_KIND):
+    # Imported only when needed, so a Boltz or AF2 run never touches the protenix MSA tools.
     from protenix.backend import download_data, _resolve_model_path
-    from flexcraft.structure.protenix._model import Protenix, ProtenixEvaluator
-    from flexcraft.structure.protenix._data import ProtenixSpec, _run_msa_search
-    from flexcraft.structure.protenix._result import ProtenixPrediction
+    from flexcraft.structure.protenix._data import _run_msa_search
 
 binder_length = opt.length
 resume = opt.resume == "True"
 dock_blueprint = opt.dock_blueprint == "True"
 use_target_template = opt.target_use_template == "True"
+# the standalone target structure is predicted whenever either flag is set
+need_target_structure = dock_blueprint or use_target_template
 # In docked mode the blueprint comes from the target-conditioned ve model, so the free-monomer
 # vp path is switched off entirely (different model, different length, dead cloud_std).
 sample_structure = (opt.sample_structure == "True") and not dock_blueprint
@@ -401,23 +410,35 @@ msa_dir = f"{opt.out_path}/msa" if opt.msa_dir == "none" else opt.msa_dir
 os.makedirs(msa_dir, exist_ok=True)
 target_pdb_dir = (f"{opt.out_path}/target_structures"
                   if opt.target_pdb_dir == "none" else opt.target_pdb_dir)
-if use_protenix:
+if TARGET_KIND != "joltz":
     # The cached target structure is what gets templated / docked against, so Boltz- and
     # Protenix-predicted targets must never share a cache: a Protenix run would otherwise silently
     # pick up Boltz's prediction of the same sequence (same filename) and vice versa, confounding
     # the model comparison. The Joltz path stays flat, so existing caches are untouched. To force
     # both models onto the same target structure, copy the PDB into this subdirectory by hand.
-    target_pdb_dir = f"{target_pdb_dir}/{opt.structure_model}"
+    # (keyed on the model that PREDICTS the target: for Protenix that is the structure model
+    # itself, so existing caches stay valid; an AF2 run defaults to Boltz-predicted targets and
+    # shares the flat Joltz cache.)
+    target_pdb_dir = f"{target_pdb_dir}/{TARGET_TAG}"
 if dock_blueprint or use_target_template:
     os.makedirs(target_pdb_dir, exist_ok=True)
 
 def _protenix_chain_msa_dirs(path: str, num_chains: int) -> list:
     return [f"{path}/chain_{i}" for i in range(num_chains)]
 
-msa_paths = {}
-for name, target_sequence in targets:
+# MSA caches per consuming model kind: the structure model (always, as before) and, when a
+# target structure is predicted, the target model. AF2 ignores MSAs and consumes none.
+msa_kinds = set()
+if uses_msa(STRUCTURE_MODEL):
+    msa_kinds.add(MODEL_KIND)
+if need_target_structure and uses_msa(TARGET_MODEL):
+    msa_kinds.add(TARGET_KIND)
+msa_paths = {"joltz": {}, "protenix": {}}
+if not msa_kinds:
+    print(f"[msa] skipped: {STRUCTURE_MODEL} ignores MSAs")
+for msa_kind, (name, target_sequence) in [(k, t) for k in sorted(msa_kinds) for t in targets]:
     digest = _seq_hash(target_sequence)
-    if use_protenix:
+    if msa_kind == "protenix":
         # Protenix takes an MSA as a directory of a3m files per chain, not Boltz's npz feature
         # dump. One directory per target chain: {path}/chain_{i}/{non_pairing,pairing}.a3m. The
         # a3m files do not depend on the model, so v1 and v2 share this cache.
@@ -450,29 +471,34 @@ for name, target_sequence in targets:
                 shutil.copytree(by_sequence[chain], dst)
             shutil.rmtree(tmp, ignore_errors=True)
             time.sleep(opt.msa_sleep)
-        msa_paths[name] = path
+        msa_paths[msa_kind][name] = path
         continue
     path = f"{msa_dir}/{name}_{digest}.npz"
     if not os.path.isfile(path):
         print(f"[msa] querying colabfold: {name} ({len(target_sequence)} aa)")
         # Target chains only -- no binder chain. precomputed_msa(..., start_chain=1)
         # below re-attaches this block at token offset binder_length.
+        from flexcraft.structure.boltz._data import JoltzSpec   # save_msa is Boltz-specific
         (JoltzSpec()
             .add_protein(*target_sequence.split(":"), use_msa=True)
             .save_msa(path, cache=opt.boltz_path))
         time.sleep(opt.msa_sleep)
     else:
         print(f"[msa] cached: {path}")
-    msa_paths[name] = path
+    msa_paths[msa_kind][name] = path
 
 if opt.msa_only == "True":
-    if use_protenix:
+    protenix_models = sorted({m for m, k, needed in (
+        (STRUCTURE_MODEL, MODEL_KIND, True), (TARGET_MODEL, TARGET_KIND, need_target_structure))
+        if k == "protenix" and needed})
+    if protenix_models:
         # Keep ALL network use in this stage: fetch the checkpoint and the shared CCD data now
         # (download only, no model load), so a firewalled compute node fails here, before any
         # GPU time is spent, rather than at first use.
-        print(f"[protenix] prefetching {PROTENIX_CHECKPOINTS[opt.structure_model]} + CCD data")
         download_data()
-        _resolve_model_path(PROTENIX_CHECKPOINTS[opt.structure_model])
+        for _m in protenix_models:
+            print(f"[protenix] prefetching {_m} + CCD data")
+            _resolve_model_path(_m)
     print("--msa_only True: MSAs cached, exiting before model load.")
     raise SystemExit(0)
 
@@ -531,39 +557,34 @@ if dock_blueprint:
     salad_ve_config, salad_ve_params = si.make_salad_model(
         "default_ve_scaled", opt.salad_ve_path)
 
-def _make_protenix_predictor(protenix_model, num_recycle=4, sampling_steps=25):
-    """Full-atom predictor for Protenix: spec -> prediction, the counterpart of Joltz2.predictor().
-
-    Built here rather than taken from Protenix.predictor(), which cannot currently be called: it
-    reads self.cache (never set on Protenix) and passes num_sampling_steps / deterministic to
-    ProtenixEvaluator, which has neither field. Only pieces that work are used: the evaluator's
-    _predict, ProtenixSpec.to_input() (which takes no pad/cache arguments) and
-    ProtenixPrediction. Unlike Protenix.evaluator(), the sampler is NOT overridden, so it runs
-    the checkpoint's own diffusion settings (gamma0 0.8, eta 1.5), as Joltz2's predictor does.
-    """
-    evaluator = ProtenixEvaluator(
-        model=protenix_model.model, num_recycle=num_recycle, sampling_steps=sampling_steps)
-    jit_predict = eqx.filter_jit(evaluator._predict)
-    def _predict(key, spec):
-        protenix_input, writer = spec.to_input()
-        prediction = jit_predict(key, protenix_input.features, num_samples=1)
-        return ProtenixPrediction(data=prediction.data, writer=writer)
-    return _predict
-
 # Backend-neutral handles used everywhere below:
 #   structure_pred(key, spec) -> prediction   (.result, .save_pdb)   full-atom predictor
 #   structure_eval(params)    -> evaluator    (.predict(key, input, num_samples) -> result)
 #   params["structure"]                        evaluator parameters, differentiated through in loss()
-# 25 sampling steps and 4 recycles for both backends, exactly the values Joltz always used.
-if use_protenix:
-    model = Protenix(model=PROTENIX_CHECKPOINTS[opt.structure_model])
-    structure_pred = _make_protenix_predictor(model, num_recycle=4, sampling_steps=25)
-    structure_eval, structure_eval_params = model.evaluator(sampling_steps=25, num_recycle=4)
-else:
-    model = Joltz2(cache=opt.boltz_path)
-    structure_pred = model.predictor(num_recycle=4)
-    structure_eval, structure_eval_params = model.evaluator(num_recycle=4)
+#   target_pred(key, spec)    -> prediction   predicts the standalone target (see --target_model)
+# 25 sampling steps and 4 recycles for every model, exactly the values Joltz always used. For
+# Protenix the full-atom predictor does NOT override the checkpoint's diffusion settings (gamma0
+# 0.8, eta 1.5) while the differentiable evaluator does -- the same split Joltz has. AF2 has no
+# diffusion sampler, ignores num_sampling_steps and returns a single sample.
+model = AF3Like(
+    STRUCTURE_MODEL,
+    **model_init_kwargs(STRUCTURE_MODEL, boltz_cache=opt.boltz_path, af_cache=opt.af_path))
+structure_pred = model.predictor(num_recycle=4)
+structure_eval, structure_eval_params = model.evaluator(num_recycle=4, num_sampling_steps=25)
 params["structure"] = structure_eval_params
+target_pred = None
+if need_target_structure:
+    target_pred = structure_pred if TARGET_MODEL == STRUCTURE_MODEL else AF3Like(
+        TARGET_MODEL,
+        **model_init_kwargs(TARGET_MODEL, boltz_cache=opt.boltz_path, af_cache=opt.af_path)
+    ).predictor(num_recycle=4)
+if MODEL_KIND == "af2":
+    print(f"[af2] {STRUCTURE_MODEL}: single-sequence, single-sample (num_samples forced to 1); "
+          f"non-protein chains and constraints are dropped. Target structures come from "
+          f"{TARGET_MODEL}.")
+    if not use_target_template:
+        print("[af2] WARNING: --target_use_template False gives the target neither an MSA nor a "
+              "template, so AF2 folds it from its bare sequence on every forward pass.")
 
 # ---------------------------------------------------------------------------------------
 # metrics (mosaic.py:209-280, verbatim apart from dropping the off-target path)
@@ -840,7 +861,7 @@ def loss(sequence, key=None, context=None, params=None):
     structure_input = params["structure_input"].set_aa(sequence)
     # predict structure
     result: AF3LikeResult = structure_eval(params["structure"]).predict(
-        keys[0], structure_input, num_samples=4)
+        keys[0], structure_input, num_samples=NUM_STRUCTURE_SAMPLES)
     # compute losses
     out = metrics(sequence, keys[1], result)
     out["result"] = result
@@ -902,7 +923,7 @@ if resume:
                 # but not protenix_v1 <-> protenix_v2, whose columns are identical -- that would
                 # silently mix two models' rows in one CSV. Files without the column are Joltz.
                 previous_model = row.get("structure_model", "joltz")
-                if previous_model != opt.structure_model:
+                if resolve_model(previous_model) != STRUCTURE_MODEL:
                     raise ValueError(
                         f"--resume: {results_path} was written with structure_model="
                         f"'{previous_model}' but this run uses '{opt.structure_model}'. Use the "
@@ -962,7 +983,7 @@ string_keys = ["dssp_requested", "dssp_salad", "dssp_predicted"]
 if dock_blueprint:
     string_keys = (["blueprint_mode", "hotspot_spec"]
                    + (["coldspot_spec"] if use_coldspots else []) + string_keys)
-if use_protenix:
+if MODEL_KIND != "joltz":
     # Provenance for merged / copied results. Joltz runs deliberately keep the original 27-column
     # schema (same conditional-schema precedent as the docked columns above), so existing runs
     # and --resume on them are unaffected.
@@ -1017,7 +1038,7 @@ def _protenix_attach_target_msa(spec, name: str, first_chain: int, num_chains: i
     use_msa=False keeps it from launching its own colabfold search. Chains without an msa_dir
     (the binder) get ProtenixSpec's dummy single-sequence MSA, which is what we want.
     """
-    dirs = _protenix_chain_msa_dirs(msa_paths[name], num_chains)
+    dirs = _protenix_chain_msa_dirs(msa_paths["protenix"][name], num_chains)
     for chain, msa in zip(spec.chains[first_chain:first_chain + num_chains], dirs):
         chain["msa_dir"] = msa
         chain["use_msa"] = False
@@ -1034,14 +1055,13 @@ def _predict_target_pdb(name: str, target_sequence: str) -> str:
     if not os.path.isfile(path):
         print(f"[target] predicting structure for {name}")
         target_chains = target_sequence.split(":")
-        if use_protenix:
-            spec = _protenix_attach_target_msa(
-                ProtenixSpec().add_protein(*target_chains), name, 0, len(target_chains))
-        else:
-            spec = (JoltzSpec()
-                    .add_protein(*target_chains)
-                    .precomputed_msa(msa_paths[name], start_chain=0))
-        pred = structure_pred(key(), spec)
+        spec = AF3LikeSpec().add_protein(*target_chains)
+        if TARGET_KIND == "protenix":
+            spec = _protenix_attach_target_msa(spec, name, 0, len(target_chains))
+        elif TARGET_KIND == "joltz":
+            spec = spec.precomputed_msa(msa_paths["joltz"][name], start_chain=0)
+        # AF2: single-sequence, no MSA (hence the default of a Boltz-predicted target).
+        pred = target_pred(key(), spec)
         # save_pdb, NOT save_cif: save_cif (boltz/_result.py:378) indexes
         # samples[sample_index] unconditionally, but predictor output is single-sample
         # (ndim 3), so it would slice the wrong axis.
@@ -1073,21 +1093,17 @@ def _complex_spec(binder_sequence: str, name: str, target_sequence: str):
     precomputed_msa / to_input flip chain["use_msa"] in place).
     """
     target_chains = target_sequence.split(":")
-    if use_protenix:
-        spec = ProtenixSpec().add_protein(binder_sequence).add_protein(*target_chains)
-        if use_target_template:
-            # UNLIKE Boltz, to_chains names chains of the COMPLEX, not of the template file:
-            # ProtenixSpec's _load_template writes the template residues, positionally, onto
-            # exactly these complex chains and needs their lengths to match. The binder is
-            # chain A, so the target chain(s) are B, C, ... Passing Boltz's ["A"] here would
-            # template the binder and fail on the length mismatch.
+    spec = AF3LikeSpec().add_protein(binder_sequence).add_protein(*target_chains)
+    if use_target_template:
+        if template_chains_are_complex_chains(STRUCTURE_MODEL):
+            # Protenix AND AF2, UNLIKE Boltz: to_chains names chains of the COMPLEX, not of the
+            # template file. The template residues are written positionally onto exactly these
+            # chains and their lengths must match (ProtenixSpec's _load_template, AF2Spec's
+            # to_input). The binder is chain A, so the target chain(s) are B, C, ... Passing
+            # Boltz's ["A"] here would template the binder and fail on the length mismatch.
             complex_letters = "BCDEFGHIJKLMNOPQRSTUVWXYZ"[:len(target_chains)]
             return spec.add_template(
                 _predict_target_pdb(name, target_sequence), to_chains=list(complex_letters))
-        return _protenix_attach_target_msa(spec, name, 1, len(target_chains))
-
-    spec = JoltzSpec().add_protein(binder_sequence).add_protein(*target_chains)
-    if use_target_template:
         # to_chains names chains WITHIN the template file, not the complex -- it is currently
         # a no-op in flexcraft/structure/boltz/_data.py (build_template_yaml writes the YAML
         # key "template_chain_id", but boltz/data/parse/schema.py reads "template_id"), but is
@@ -1101,16 +1117,20 @@ def _complex_spec(binder_sequence: str, name: str, target_sequence: str):
         # coordinates and 0/80 binder tokens do, for both a random and an all-X binder chain.
         return spec.add_template(
             _target_template_cif(name, target_sequence), to_chains=["A"])
+    if MODEL_KIND == "protenix":
+        return _protenix_attach_target_msa(spec, name, 1, len(target_chains))
+    if MODEL_KIND == "af2":
+        return spec     # no MSA to attach: AF2 ignores them (warned about at startup)
     # No use_msa=True here: the precomputed MSA covers the target, so this makes no network call.
-    return spec.precomputed_msa(msa_paths[name], start_chain=1)
+    return spec.precomputed_msa(msa_paths["joltz"][name], start_chain=1)
 
 def _to_input(spec):
     """Differentiable model input for a spec. Boltz pads/caches through to_input's arguments
-    (pad=False keeps the binder/target slices in metrics() exact); ProtenixSpec.to_input takes
-    none and does not pad."""
-    if use_protenix:
-        return spec.to_input()[0]
-    return spec.to_input(pad=False, cache=opt.boltz_path)[0]
+    (pad=False keeps the binder/target slices in metrics() exact); ProtenixSpec.to_input and
+    AF2Spec.to_input take none and do not pad."""
+    return spec.to_input(
+        model=STRUCTURE_MODEL,
+        **to_input_kwargs(STRUCTURE_MODEL, pad=False, cache=opt.boltz_path))[0]
 
 def _repredict(result: AF3LikeResult, name: str, target_sequence: str):
     """Full-atom re-prediction of the hardened binder against its target."""
@@ -1146,7 +1166,7 @@ def _report_stage(name, attempt, stage, sequence, prediction, design,
             distogram_nll(result, params["target_distogram"]))
     if weight_tag is not None:
         aux["distogram_weight"] = weight_tag
-    if use_protenix:
+    if MODEL_KIND != "joltz":
         aux["structure_model"] = opt.structure_model
     aux["target_length"] = str(target_length)
     aux["passed"] = "True" if _passing(aux) else "False"

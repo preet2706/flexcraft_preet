@@ -217,6 +217,20 @@ class AFInput:
             data=_update_sequence(self.data, sequence))
         return result
 
+    def set_aa(self, sequence, start=0, **kwargs) -> "AFInput":
+        """Set residues [start, start + len(sequence)) from a (n, 20) soft one-hot (or (n,)
+        integer) sequence; the rest of the complex keeps its identity. Counterpart of
+        ModelInput.set_aa, so AF2 inputs can be used wherever Boltz/Protenix inputs are.
+        Differentiable in `sequence`. Extra kwargs (reset_msa, reset_profile) are accepted
+        and ignored: AF2's update_seq always rewrites msa_feat and target_feat together.
+
+        update_seq needs the FULL-length one-hot, which lives in target_feat."""
+        if sequence.ndim == 1:
+            sequence = jax.nn.one_hot(sequence, 20, axis=-1)
+        full = jnp.asarray(self.data["target_feat"]).astype(sequence.dtype)
+        full = full.at[start:start + sequence.shape[0]].set(sequence)
+        return self.update_sequence(full)
+
     def to_data(self) -> Any:
         return ... # TODO
 
@@ -540,8 +554,9 @@ class AFResult:
     def distogram_bin_centers(self):
         return (self.distogram_bin_edges[1:] + self.distogram_bin_edges[:-1]) / 2
 
-    def to_data(self) -> DesignData:
-        """Convert an AFResult to DesignData."""
+    def to_data(self, return_samples=False) -> DesignData:
+        """Convert an AFResult to DesignData. `return_samples` only exists for signature
+        compatibility with JoltzResult/ProtenixResult: AF2 emits one structure."""
         atom14, mask14 = self.atom14
         return DesignData(data=dict(
             atom_positions=atom14,
@@ -660,8 +675,10 @@ class AFResult:
         """Save an AFResult as a compressed npz archive."""
         np.savez_compressed(
             path,
-            **{f"inputs_{k}": np.array(v) for k, v in self.inputs},
-            **{f"result_{k}": np.array(v) for k, v in self.result})
+            **{f"inputs_{k}": np.array(v) for k, v in self.inputs.items()
+               if isinstance(v, (np.ndarray, jnp.ndarray))},
+            **{f"result_{k}": np.array(v) for k, v in self.result.items()
+               if isinstance(v, (np.ndarray, jnp.ndarray))})
 
     def save_pdb(self, path):
         """Save an AFResult in PDB format at `path`."""

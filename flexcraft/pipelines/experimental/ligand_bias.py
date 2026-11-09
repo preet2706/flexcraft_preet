@@ -78,6 +78,9 @@ RDLogger.DisableLog("rdApp.*")
 
 import flexcraft.sequence.aa_codes as aas
 from flexcraft.sequence.mpnn import make_pmpnn, batch_mpnn
+from flexcraft.sequence.ligand_mpnn import make_ligmpnn, batch_ligand_mpnn
+from flexcraft.structure.boltz import (
+    joltz_ligand_selection, ligand_fields_from_selection)
 from flexcraft.utils import parse_options, Keygen, data_from_salad
 from flexcraft.files import ScoreCSV
 from flexcraft.data.data import DesignData
@@ -471,6 +474,9 @@ opt = parse_options(
     top_k_residues=5,
     pmpnn_params="params/pmpnn/v_48_030.pkl",
     pmpnn_temperature=0.1,
+    mpnn_model="pmpnn",                # pmpnn | ligand_mpnn
+    ligmpnn_params="params/ligmpnn/v_32_030_25.pkl",   # ligand_mpnn mode only
+    ligmpnn_atoms=0,                   # 0 picks a padding bucket from the target's atom count
     # -- hallucination ---------------------------------------------------------------------
     hallucination_steps=100,
     init_mode="random",                # random | salad_pmpnn
@@ -584,10 +590,69 @@ score_predict_fn = joltz_model.predictor(
     num_recycle=opt.num_recycle, num_samples=1,
     num_sampling_steps=opt.num_sampling_steps, deterministic=(opt.deterministic == "True"))
 
-_pmpnn, pmpnn_params = make_pmpnn(opt.pmpnn_params, eps=0.05, split_params=True)
+# Sequence-design model used for the amino-acid-preference readouts and the recovery term.
+# With --mpnn_model ligand_mpnn the model additionally sees the target's atoms (element
+# identity and predicted coordinates), which is what closes the gap named in this module's
+# docstring: plain ProteinMPNN never sees the target, so it reports what the backbone SHAPE
+# favours rather than what the ligand's chemistry favours.
+USE_LIGAND_MPNN = opt.mpnn_model == "ligand_mpnn"
+if USE_LIGAND_MPNN:
+    _pmpnn, pmpnn_params = make_ligmpnn(
+        opt.ligmpnn_params, eps=0.05, split_params=True)
+    _mpnn_batcher = batch_ligand_mpnn
+else:
+    _pmpnn, pmpnn_params = make_pmpnn(opt.pmpnn_params, eps=0.05, split_params=True)
+    _mpnn_batcher = batch_mpnn
 params = dict(mpnn=pmpnn_params)
-jit_pmpnn = jax.jit(_pmpnn)
-batched_pmpnn = jax.jit(batch_mpnn(_pmpnn))
+batched_pmpnn = jax.jit(_mpnn_batcher(_pmpnn))
+
+# The salad_pmpnn initialisation ALWAYS uses plain ProteinMPNN, whatever --mpnn_model says.
+# Its whole point is a target-unaware starting sequence -- "a fresh, target-unaware salad
+# blueprint ... asks whether a ligand can be grafted onto a fold that was never chosen with
+# it in mind" (see the module docstring). Letting LigandMPNN seed it would leak the target
+# into the initialisation and void that comparison; the blueprint also carries no ligand
+# atoms, so LigandMPNN could not run on it anyway.
+jit_init_pmpnn, init_pmpnn_params = None, None
+if opt.init_mode == "salad_pmpnn":
+    if USE_LIGAND_MPNN:
+        _init_pmpnn, init_pmpnn_params = make_pmpnn(
+            opt.pmpnn_params, eps=0.05, split_params=True)
+    else:
+        # same model as the scoring one, so share it rather than compiling it twice
+        _init_pmpnn, init_pmpnn_params = _pmpnn, pmpnn_params
+    jit_init_pmpnn = jax.jit(_init_pmpnn)
+
+
+def attach_ligand(data, result, selection, sample_index=None):
+    """Attach a Boltz prediction's target atoms to a DesignData, for LigandMPNN.
+
+    A no-op unless --mpnn_model is ligand_mpnn. `selection` says which atoms of the
+    prediction are ligand context and is computed once per condition in `build_condition`;
+    only the coordinates are read here. That split matters because this runs inside the
+    jitted loss: deciding *which* atoms to take depends on feature values and so cannot be
+    traced, while gathering fixed indices can.
+
+    Args:
+        data: DesignData to attach the ligand to.
+        result: the JoltzResult the target's atom coordinates are taken from.
+        selection: the condition's LigandSelection, or None when LigandMPNN is not in use.
+        sample_index: which diffusion sample's pose to take. None keeps every sample, which
+            matches a batched (num_samples, ...) DesignData.
+
+    Returns:
+        DesignData, with ligand fields attached when LigandMPNN is in use.
+    """
+    if not USE_LIGAND_MPNN:
+        return data
+    if selection is None:
+        # silently skipping here would hand LigandMPNN a ligand-free input and fail much later
+        # and far away, as an unrelated-looking "missing ligand" error inside the model
+        raise ValueError(
+            "--mpnn_model ligand_mpnn needs a LigandSelection for every call that scores a "
+            "sequence, but none was passed. Thread `ligand_selection` from build_condition "
+            "through to this call.")
+    return data.update(**ligand_fields_from_selection(
+        result, selection, sample_index=sample_index))
 
 sampler = None
 if opt.init_mode == "salad_pmpnn":
@@ -658,15 +723,20 @@ def _class_fractions(prob: np.ndarray, weights: np.ndarray = None, prefix: str =
 
 # ============================== hallucination ==============================
 
-def hallucination_metrics(sequence, key, result, has_target: bool, target_chain_indices: list):
+def hallucination_metrics(sequence, key, result, has_target: bool, target_chain_indices: list,
+                          ligand_selection=None):
     """mosaic_scan.py's metrics() (L591-643), keeping only the terms the loss uses. The
     binder is always the first `num_aa` tokens, so it is sliced positionally. PAE terms use
     positional slices and iptm/eptm use a boolean binder mask, so they cover any number of
-    target chains; chain_contact_score takes the list of target chain indices."""
+    target chains; chain_contact_score takes the list of target chain indices.
+
+    `ligand_selection` is closed over by the loss rather than derived here, because this runs
+    inside jit (see `attach_ligand`)."""
     res_data = result.to_data(return_samples=True)
     binder_data = res_data[:num_aa]
     dssp = binder_data.p_dssp
     pmpnn_input = res_data.update(aa=aas.translate(res_data["aa"], aas.AF2_CODE, aas.PMPNN_CODE))
+    pmpnn_input = attach_ligand(pmpnn_input, result, ligand_selection)
     is_binder = jnp.zeros((pmpnn_input.aa.shape[0],), dtype=jnp.bool_).at[:num_aa].set(True)
     logits = batched_pmpnn(params["mpnn"], key, pmpnn_input.drop_aa(where=is_binder))["logits"]
     logits = aas.translate_onehot(logits, aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
@@ -698,10 +768,12 @@ def hallucination_metrics(sequence, key, result, has_target: bool, target_chain_
     return out
 
 
-def make_loss_fn(has_target: bool, target_chain_indices: list):
-    """One loss closure per condition. `has_target` and `target_chain_indices` are closed over
-    as plain Python values rather than passed through the jitted `params` pytree: a traced
-    bool cannot drive a Python `if`, and a list would become pytree leaves."""
+def make_loss_fn(has_target: bool, target_chain_indices: list, ligand_selection=None):
+    """One loss closure per condition. `has_target`, `target_chain_indices` and
+    `ligand_selection` are closed over as plain Python values rather than passed through the
+    jitted `params` pytree: a traced bool cannot drive a Python `if`, a list would become
+    pytree leaves, and the ligand selection has to stay concrete because it indexes a
+    fixed-shape gather."""
     def loss(sequence, key=None, context=None, params=None):
         keys = jax.random.split(key, 3)
         # forbid cysteines
@@ -710,7 +782,9 @@ def make_loss_fn(has_target: bool, target_chain_indices: list):
         structure_input = params["predictor_input"].set_aa(sequence)
         result = evaluator(params["structure"]).predict(
             keys[0], structure_input, num_samples=opt.num_samples)
-        out = hallucination_metrics(sequence, keys[1], result, has_target, target_chain_indices)
+        out = hallucination_metrics(
+            sequence, keys[1], result, has_target, target_chain_indices,
+            ligand_selection=ligand_selection)
         if has_target:
             value = (
                   out["binder_target_contacts"]
@@ -748,8 +822,20 @@ def build_condition(entry):
     predictor_input, _ = spec.to_input(pad=False, cache=opt.boltz_path)
     has_target = entry is not None
     target_chain_indices = list(range(1, 1 + _num_target_chains(entry))) if has_target else []
-    loss_update = make_loss_fn(has_target, target_chain_indices)
-    return dict(predictor_input=predictor_input, structure=evaluator_params), loss_update
+    # Which atoms are ligand context is fixed for a condition (only the binder's sequence
+    # changes during hallucination), so it is decided once here, on concrete features, and
+    # closed over by the loss. The apo condition has no non-protein atoms and gets a single
+    # masked dummy atom.
+    ligand_selection = None
+    if USE_LIGAND_MPNN:
+        ligand_selection = joltz_ligand_selection(
+            predictor_input, num_atoms=opt.ligmpnn_atoms or None)
+        print(f"  ligand context: {ligand_selection.num_valid} atoms "
+              f"(padded to {len(ligand_selection)})")
+    loss_update = make_loss_fn(
+        has_target, target_chain_indices, ligand_selection=ligand_selection)
+    return (dict(predictor_input=predictor_input, structure=evaluator_params),
+            loss_update, ligand_selection)
 
 
 # mosaic_scan.py's _passing(): a design passes when ALL of these hold on its re-prediction
@@ -758,14 +844,16 @@ MOSAIC_PASS = dict(ipsae=0.75, plddt=0.80, binder_target_pae=5.0, target_binder_
                    recovery=0.60)
 
 
-def mosaic_scores(sequence, key, result, entry) -> dict:
+def mosaic_scores(sequence, key, result, entry, ligand_selection=None) -> dict:
     """mosaic_scan.py's metrics() on a (single-sample) re-prediction, plus its pass/fail.
     `sequence` is the final SOFT hallucinated distribution (as in mosaic, whose recovery is
     (soft sequence * ProteinMPNN prob) even though the structure is that of the hardened
-    sequence). No target means no interface terms, so `passed` is undefined for the apo."""
+    sequence). No target means no interface terms, so `passed` is undefined for the apo.
+    `ligand_selection` is the condition's, as for the loss (see `attach_ligand`)."""
     has_target = entry is not None
     target_chain_indices = list(range(1, 1 + _num_target_chains(entry))) if has_target else []
-    m = hallucination_metrics(sequence, key, result, has_target, target_chain_indices)
+    m = hallucination_metrics(sequence, key, result, has_target, target_chain_indices,
+                              ligand_selection=ligand_selection)
     out = dict(mosaic_plddt=float(m["plddt"]), mosaic_recovery=float(m["recovery"]))
     if not has_target:
         return out
@@ -803,7 +891,8 @@ def make_init_sequence(row_index: int, key):
             num_aa, p=0.0, p_keep_loop=1.0, return_string=True)
         salad_data["cloud_std"] = num_aa ** 0.4 + np.random.rand() * opt.std_buffer
         design = data_from_salad(sampler(salad_params, salad_key, salad_data, init_prev))
-        logits = jit_pmpnn(pmpnn_params, pmpnn_key, design.drop_aa())["logits"]
+        logits = jit_init_pmpnn(
+            init_pmpnn_params, pmpnn_key, design.drop_aa())["logits"]
         sequence = aas.translate_onehot(logits, aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
         return jax.nn.softmax(sequence / opt.init_temperature, axis=-1), design
     sequence = jax.random.gumbel(key, (num_aa, 20), dtype=jnp.float32)
@@ -918,12 +1007,22 @@ def _confidence_summary(result, best_idx: int, chain_index: np.ndarray, has_targ
     return out
 
 
-def _aa_preference(binder_data: DesignData, key) -> tuple:
-    """(num_aa, 20) AF2-ordered ProteinMPNN preference distribution for the best-of-N binder
-    structure: feed the sequence-masked, target-excluded binder backbone through ProteinMPNN
-    and softmax its logits (cysteine forbidden, as in titration.py)."""
+def _aa_preference(binder_data: DesignData, key, result=None, ligand_selection=None,
+                   sample_index=None) -> tuple:
+    """(num_aa, 20) AF2-ordered amino-acid preference distribution for the best-of-N binder
+    structure: feed the sequence-masked, target-excluded binder backbone through the
+    sequence-design model and softmax its logits (cysteine forbidden, as in titration.py).
+
+    Under --mpnn_model pmpnn this measures what the binder's backbone SHAPE favours, since
+    ProteinMPNN cannot see the target at all. Under --mpnn_model ligand_mpnn the target's
+    atoms are supplied as chemical context, so the same readout reflects the ligand's
+    chemistry as well - the two runs differ in exactly that term."""
     pmpnn_input = binder_data.update(
         aa=aas.translate(binder_data["aa"], aas.AF2_CODE, aas.PMPNN_CODE)).drop_aa()
+    if result is not None:
+        # binder_data is the single best-of-N structure, so take that sample's ligand pose
+        pmpnn_input = attach_ligand(
+            pmpnn_input, result, ligand_selection, sample_index=sample_index)
     logits = batched_pmpnn(params["mpnn"], key, pmpnn_input)["logits"]
     logits = aas.translate_onehot(logits, aas.PMPNN_CODE, aas.AF2_CODE)[..., :20]
     prob = jax.nn.softmax(
@@ -936,7 +1035,8 @@ def _aa_preference(binder_data: DesignData, key) -> tuple:
 # ============================== per-attempt driver ==============================
 
 def run_attempt(row_index: int, condition_index: int, attempt_index: int, entry,
-                 condition_params: dict, loss_update, key, apo_binder_data=None) -> tuple:
+                 condition_params: dict, loss_update, key, apo_binder_data=None,
+                 ligand_selection=None) -> tuple:
     """One hallucination + analysis. entry=None is the apo baseline (row 0). Returns (aux dict
     for the CSV row, (num_aa,) 0/1 contact array [NaN for apo], (num_aa, 20) amino-acid
     preference, the best-of-N binder-only DesignData [the apo one is the RMSD reference])."""
@@ -997,7 +1097,8 @@ def run_attempt(row_index: int, condition_index: int, attempt_index: int, entry,
 
     # mosaic-style scoring + success filter on a single-sample re-prediction
     score_pred = score_predict_fn(jax.random.fold_in(key, 102), _full_spec(hard_sequence))
-    aux.update(mosaic_scores(sequence, pmpnn_key, score_pred.result, entry))
+    aux.update(mosaic_scores(sequence, pmpnn_key, score_pred.result, entry,
+                             ligand_selection=ligand_selection))
     if aux.get("passed") == "True":
         score_pred.save_pdb(f"{opt.out_path}/success/{tag}.pdb")
 
@@ -1009,7 +1110,12 @@ def run_attempt(row_index: int, condition_index: int, attempt_index: int, entry,
     if apo_binder_data is not None:
         aux["rmsd_to_apo"] = _rmsd_to_apo(binder_data, apo_binder_data)
 
-    aa_prob, aa_stats = _aa_preference(binder_data, pmpnn_key)
+    # `result` is passed for the apo too: LigandMPNN has no zero-atom code path, so the apo
+    # condition's masked dummy ligand still has to be attached. attach_ligand does nothing
+    # under --mpnn_model pmpnn.
+    aa_prob, aa_stats = _aa_preference(
+        binder_data, pmpnn_key, result=result,
+        ligand_selection=ligand_selection, sample_index=best_idx)
     aux.update(aa_stats)
     aux.update(_class_fractions(aa_prob, weights=None))
     if has_target and np.nansum(contact_freq) > 1e-6:
@@ -1081,10 +1187,11 @@ def _save_arrays():
 # row's RMSD-to-apo needs it. Recomputation is deterministic (same seed -> same keys); its
 # CSV/npy row is only re-WRITTEN if it was not already done.
 
-apo_params, apo_loss_update = build_condition(None)
+apo_params, apo_loss_update, apo_ligand_selection = build_condition(None)
 try:
     apo_aux, apo_contact, apo_aa_prob, apo_binder_data = run_attempt(
-        0, 0, 0, None, apo_params, apo_loss_update, _row_key(0), apo_binder_data=None)
+        0, 0, 0, None, apo_params, apo_loss_update, _row_key(0), apo_binder_data=None,
+        ligand_selection=apo_ligand_selection)
 except Exception as ex:
     raise RuntimeError("apo baseline failed; cannot continue (every other row depends on it "
                         "for RMSD comparison)") from ex
@@ -1111,14 +1218,15 @@ for condition_index, entry in enumerate(MANIFEST):
     if not todo:
         print(f"[skip] {name}: all {opt.attempts_per_target} attempts already complete")
         continue
-    condition_params, loss_update = build_condition(entry)
+    condition_params, loss_update, ligand_selection = build_condition(entry)
     print(f"=== {name} ({entry['category']}): {len(todo)} attempt(s) ===")
     for row in todo:
         row_index, attempt_index = row["row_index"], row["attempt_index"]
         try:
             aux, contact_freq, aa_prob, _ = run_attempt(
                 row_index, condition_index, attempt_index, entry, condition_params,
-                loss_update, _row_key(row_index), apo_binder_data=apo_binder_data)
+                loss_update, _row_key(row_index), apo_binder_data=apo_binder_data,
+                ligand_selection=ligand_selection)
             results.write_line(aux)
             if aux.get("passed") == "True":
                 success_results.write_line(aux)

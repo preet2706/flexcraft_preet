@@ -20,27 +20,57 @@ _CHAIN_NAMES = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 class AF2Spec(InputSpec):
     def to_input(self, **kwargs):
+        """AF2 model input. Returns `(AFInput, None)` like every other spec returns
+        `(input, writer)`; there is no writer because AFResult.save_pdb writes directly.
+
+        AF2 ignores MSAs, and drops non-protein chains and constraints (with a warning).
+        `to_chains` of a template names chains of the COMPLEX (as for ProtenixSpec, see
+        protenix/_data.py:_load_template), NOT chains inside the template file as for Boltz:
+        the template residues are scattered positionally onto exactly those chains.
+        Extra kwargs (pad, cache) are accepted and ignored.
+        """
+        protein_chains = []
         for chain in self.chains:
             if chain["kind"] != "protein":
                 warnings.warn(f"Skipping invalid chain type '{chain['kind']}' for AF2.")
+                continue
+            protein_chains.append(chain)
         if self.constraints:
-            warnings.warn(f"Skipping provided constraints for AF2.")
-        af_input = AFInput.from_chains(*[c for c in self.chains if c["kind"] == "protein"])
+            warnings.warn("Skipping provided constraints for AF2.")
+        if self.precomputed_msas or any(c.get("use_msa") for c in protein_chains):
+            warnings.warn("AF2 ignores MSAs: running single-sequence.")
+        parts = []
+        for chain in protein_chains:
+            for _ in range(chain.get("num_repeats", 1)):
+                parts.append(DesignData.from_sequence(chain["sequence"]))
+        complex_data = DesignData.concatenate(parts, sep_chains=True)
+        chain_index = np.asarray(complex_data["chain_index"])
+        af_input = AFInput.from_data(complex_data)
         for template in self.templates:
-            if template.endswith(".pdb", ".pdb1"):
-                tdata: DesignData = PDBFile(template).to_data()
-            elif template.endswith(".cif"):
-                raise NotImplementedError("Under construction.")
-                # tdata: DesignData = CIFFile(template).to_data().aa_only()
-            if "template_chains" in template:
-                chains = [_CHAIN_NAMES.index(c) for c in template["template_chains"]]
+            if "pdb" not in template:
+                raise NotImplementedError("AF2 templates must be '.pdb' files.")
+            tdata: DesignData = PDBFile(path=template["pdb"]).to_data()
+            to_chains = template.get("template_chains")
+            if to_chains:
+                selected = [_CHAIN_NAMES.index(c) for c in to_chains]
             else:
-                chains = np.arange(len(_CHAIN_NAMES))
-            pos = tdata.data["atom_positions"]
-            aa = af_input.data["aatype"]
-            where = jnp.isin(af_input.chain_index, chains)
-            af_input = af_input.add_template(pos=pos, aa=aa, where=where)
-        return af_input
+                selected = list(range(len(parts)))
+            where = np.isin(chain_index, np.asarray(selected))
+            assert tdata.size == int(where.sum()), (
+                f"AF2 template '{template['pdb']}' has {tdata.size} residues but complex "
+                f"chains {to_chains or 'all'} span {int(where.sum())}. to_chains names chains "
+                f"of the COMPLEX and the template is written onto them positionally.")
+            index = jnp.asarray(np.flatnonzero(where))
+            # complex-length template: real coordinates on the selected rows, zero atom_mask
+            # elsewhere (AFInput.add_template ANDs atom_mask into `where`).
+            full = complex_data.update(
+                atom_positions=jnp.zeros_like(complex_data["atom_positions"]).at[index].set(
+                    jnp.asarray(tdata["atom_positions"])),
+                atom_mask=jnp.zeros_like(complex_data["atom_mask"]).at[index].set(
+                    jnp.asarray(tdata["atom_mask"])),
+                aa=jnp.asarray(complex_data["aa"]).at[index].set(jnp.asarray(tdata["aa"])))
+            af_input = af_input.add_template(full, where=jnp.asarray(where))
+        return af_input, None
 
 class AFEvaluator:
     def __init__(self, model, params):
@@ -48,6 +78,7 @@ class AFEvaluator:
         self.params = params
 
     def predict(self, key, input: AFInput, num_samples=1):
+        """AF2 emits a single structure: `num_samples` is accepted and ignored."""
         return self.model(self.params, key, input)
     
     def __call__(self, key, input: AFInput, num_samples=1):
@@ -56,7 +87,7 @@ class AFEvaluator:
 @dataclass
 class AF2Prediction:
     data: AFResult
-    writer: Any
+    writer: Any = None
     @property
     def result(self):
         return self.data
@@ -73,14 +104,17 @@ class AF2Prediction:
         self.result.save(path)
 
 class AFWrapper:
-    def __init__(self, model: str = "af2_model_1_ptm", cache: str = "params/af/"):
-        self.model_name = model[4:]
-        self.af2_params = get_model_haiku_params(
+    def __init__(self, model: str = "af2_model_1_ptm", cache: str = "params/af/",
+                 use_remat: bool = True):
+        self.model_name = model[4:]    # strip the "af2_" kind prefix
+        self.af2_params = jax.tree.map(jnp.asarray, get_model_haiku_params(
                 model_name=self.model_name,
-                data_dir=cache, fuse=True)
+                data_dir=cache, fuse=True))
         self.af2_config = model_config(self.model_name)
         self.multimer = "multimer" in self.model_name
         self.af2_config.model.global_config.use_dgram = False
+        # as in pipelines/bind/hal/af2.py: needed to differentiate through a binder-target complex
+        self.af2_config.model.global_config.use_remat = use_remat
 
     def evaluator(self, num_recycle=4, **kwargs):
         af2 = jax.jit(make_predict(make_af2(self.af2_config, self.multimer), num_recycle=num_recycle))
@@ -91,6 +125,6 @@ class AFWrapper:
     def predictor(self, num_recycle=4, **kwargs):
         evaluator, params = self.evaluator(num_recycle=num_recycle, **kwargs)
         def _wrapper(key, spec: AF2Spec, **kwargs):
-            input = spec.to_input()
-            return AF2Prediction(evaluator(params)(key, input, num_samples=1))
+            input, writer = spec.to_input()
+            return AF2Prediction(data=evaluator(params)(key, input, num_samples=1), writer=writer)
         return _wrapper

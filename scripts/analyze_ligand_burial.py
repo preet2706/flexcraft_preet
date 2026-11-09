@@ -206,8 +206,9 @@ def fig_scatter(per_attempt, args, run_label):
     ax.set_xlabel(f"binder residues within {args.contact_cutoff:g} Å of the target")
     ax.set_ylabel("fraction of target surface buried")
     ax.set_ylim(0, 1)
-    ax.set_title(f"Pocket = many contacts and high burial ({run_label}); rings = per-target medians")
-    ax.legend(frameon=False, fontsize=8, loc="upper left")
+    ax.set_title(f"Pocket = many contacts and high burial\n({run_label}; rings = per-target medians)",
+                 fontsize=10.5)
+    ax.legend(frameon=False, fontsize=8, loc="center right")
     fig.savefig(f"{args.out_path}/ligand_burial_vs_contacts.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
 

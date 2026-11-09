@@ -3,6 +3,7 @@ protein structure and sequence for passing information between different protein
 models."""
 
 import os
+import warnings
 from copy import copy
 from typing import Any, List, cast, Iterable, Dict
 
@@ -20,6 +21,25 @@ import jax
 import jax.numpy as jnp
 import chex
 from chex import Array
+
+# Fields which are not indexed by residue. These describe the scene a design sits in
+# (currently: ligand atoms for LigandMPNN) and have their own leading axis, so they must not
+# be sliced, indexed or concatenated along the residue axis.
+NON_RESIDUE_KEYS = ("ligand_positions", "ligand_elements", "ligand_mask")
+
+def _is_residue_key(key: str) -> bool:
+    """Check if a DesignData field is indexed by residue.
+
+    Any field whose name starts with "ligand_" is a per-ligand-atom field and is therefore
+    scene-level rather than per-residue.
+
+    Args:
+        key: name of a DesignData field.
+
+    Returns:
+        True if the field is indexed by residue.
+    """
+    return not key.startswith("ligand_")
 
 class Block:
     def __init__(self, data, name, weight=1.0):
@@ -274,6 +294,9 @@ class DesignData:
             DesignData object sliced by the input index. If a list of indices was passed,
             instead contains the concatenation of DesignData objects resulting from slicing
             with each of the indices in the input list.
+            Non-residue fields (see `NON_RESIDUE_KEYS`) are passed through unchanged: they
+            describe the whole scene, so they are neither sliced nor duplicated when a list
+            of indices repeats part of the structure.
         """
         if not isinstance(index, (list, tuple)):
             index = [index]
@@ -281,11 +304,13 @@ class DesignData:
         if self.is_single_sample:
             return DesignData(
                 data={k: jnp.concatenate([v[c] for c in index], axis=0)
+                         if _is_residue_key(k) else v
                     for k, v in self.data.items()})
         return DesignData(
-            data={k: jnp.concatenate([v[c] for c in index], axis=0)
-                     if k != "atom_positions"
-                     else jnp.concatenate([v[:, c] for c in index], axis=0)
+            data={k: v if not _is_residue_key(k)
+                     else (jnp.concatenate([v[c] for c in index], axis=0)
+                           if k != "atom_positions"
+                           else jnp.concatenate([v[:, c] for c in index], axis=0))
                     for k, v in self.data.items()})
 
     def update_index(self, index, value=None, **kwargs):
@@ -310,7 +335,9 @@ class DesignData:
         # print("CI_SHAPE", contig_index.shape, index[0].start, index[0].stop, index[0])
         # FIXME
         if value is not None:
-            result.data = {k: v.at[index].set(value[k]) for k, v in result.data.items() if k in value}
+            result.data = {k: v.at[index].set(value[k]) if _is_residue_key(k) else v
+                           for k, v in result.data.items()
+                           if k in value or not _is_residue_key(k)}
         for k, v in kwargs.items():
             # print(f"V_SHAPE {k}", v.shape)
             result.data[k] = result.data[k].at[index].set(v)
@@ -333,6 +360,52 @@ class DesignData:
             return self.update(
                 aa=jnp.where(where, jnp.full_like(self.aa, 20), self.aa))
         return self.copy()
+
+    @property
+    def has_ligand(self) -> bool:
+        """Check if this DesignData carries ligand atoms for LigandMPNN."""
+        return "ligand_positions" in self.data
+
+    @property
+    def num_ligand_atoms(self) -> int:
+        """Number of ligand atoms, including masked padding. 0 if there is no ligand."""
+        if not self.has_ligand:
+            return 0
+        return self.data["ligand_positions"].shape[-2]
+
+    def with_ligand(self, ligand, num_atoms=None) -> "DesignData":
+        """Attach ligand atoms to a DesignData object, for use with LigandMPNN.
+
+        Args:
+            ligand: a `flexcraft.files.ligand.LigandAtoms` object, or a dict already
+                containing the "ligand_positions", "ligand_elements" and "ligand_mask"
+                fields.
+            num_atoms: optional static number of ligand atoms to pad to. Padding to a fixed
+                size keeps `jax.jit` from recompiling for every distinct ligand.
+
+        Returns:
+            DesignData with ligand fields attached.
+        """
+        if hasattr(ligand, "to_data_fields"):
+            fields = ligand.to_data_fields(num_atoms=num_atoms)
+        else:
+            fields = {k: v for k, v in dict(ligand).items() if k in NON_RESIDUE_KEYS}
+            missing = set(NON_RESIDUE_KEYS) - set(fields)
+            if missing:
+                raise ValueError(f"ligand dict is missing fields: {sorted(missing)}")
+        return self.update(**fields)
+
+    def drop_ligand(self) -> "DesignData":
+        """Remove ligand atom information from a DesignData object.
+
+        Note that running LigandMPNN on the result is not the same as running ProteinMPNN:
+        the ligand branch still contributes its residual to the node embeddings. Use this to
+        compare a design against its own apo baseline under the same model.
+        """
+        result = self.copy()
+        for key in NON_RESIDUE_KEYS:
+            result.data.pop(key, None)
+        return result
 
     def copy(self) -> "DesignData":
         return DesignData(data=copy(self.data))
@@ -366,10 +439,26 @@ class DesignData:
                 chain indices. Default: True.
             sep_batch: optional boolean specifying if concatenated DesignData should have separate
                 batch indices. Default: False
+
+        Non-residue fields (see `NON_RESIDUE_KEYS`) describe the scene rather than a residue
+        range, so they are not concatenated. They are instead carried over from whichever
+        operand provides them - without this, composing a ligand-bearing target with a
+        ligand-free binder would silently drop the ligand, because `concatenate_dict` keeps
+        only the fields common to every operand.
         """
         result = DesignData(
             data=concatenate_dict([
-                item.data for item in items], axis=0))
+                item.data for item in items], axis=0, skip_keys=NON_RESIDUE_KEYS))
+        for key in NON_RESIDUE_KEYS:
+            providers = [item for item in items if key in item.data]
+            if not providers:
+                continue
+            if len(providers) > 1:
+                warnings.warn(
+                    f"multiple DesignData operands provide the non-residue field {key!r}; "
+                    "keeping the first. Merge ligands explicitly with "
+                    "LigandAtoms.concatenate if you meant to combine them.")
+            result.data[key] = providers[0].data[key]
         if sep_chains:
             result.data["chain_index"] = _sep_groups([c.chain_index for c in items])
         if sep_batch and "batch_index" in items[0].data:
@@ -493,13 +582,17 @@ class DesignData:
             f.write(to_pdb(self.to_protein()))
 
 
-def concatenate_dict(items: List[dict], axis=0, drop_non_common=True) -> dict:
+def concatenate_dict(items: List[dict], axis=0, drop_non_common=True, skip_keys=()) -> dict:
     """Concatenate multiple dictionaries of arrays by concatenating
     arrays for each key along an axis.
-    
+
     Args:
         items: list of dictionaries of arrays.
         axis: axis along which to concatenate arrays for each key.
+        drop_non_common: drop keys which are not present in every input dictionary.
+        skip_keys: keys to leave out of the result entirely. Use this for fields whose
+            leading axis is not the concatenation axis; the caller is then responsible for
+            putting them back.
 
     Returns:
         Dictionary containing concatenated arrays for each key in the
@@ -508,7 +601,7 @@ def concatenate_dict(items: List[dict], axis=0, drop_non_common=True) -> dict:
     return {k: jnp.concatenate([
         item[k] for item in items], axis=axis)
         for k in items[0]
-        if drop_non_common and _all_have(items, k)}
+        if k not in skip_keys and drop_non_common and _all_have(items, k)}
 
 def _all_have(items, key):
     return all([key in i for i in items])

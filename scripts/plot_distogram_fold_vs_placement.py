@@ -41,7 +41,7 @@ DEFAULT_RUNS = {
 }
 MODEL_TITLE = {
     "joltz": "Boltz-2 (joltz)", "protenix_v1": "Protenix v1", "protenix_v2": "Protenix v2",
-    "boltz_ext": "Boltz-2 (joltz) — extended weights 3–5",
+    "boltz_ext": "Boltz-2 (joltz) — extended weights 3–5", "af2": "AlphaFold2",
 }
 
 X_COL, X_LABEL = "epitope_recall_vs_blueprint", "Placement recovery\n(fraction of blueprint epitope contacted)"
